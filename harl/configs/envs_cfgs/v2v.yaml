@@ -1,0 +1,33 @@
+# v2v.yaml - Configuration for the V2X Reinforcement Learning Environment
+
+# -- Simulation Settings --
+env_name: "v2v"
+episode_duration: 20000  # Total simulation time steps (ms)
+communication_range: 320.0 # Communication range for vehicles in meters
+
+# -- Vehicle and Attacker Settings --
+num_vehicles: 20  # Number of normal vehicles
+num_attackers: 1  # Number of attackers
+vehicle_resource_mode: 'Combine' # Resource selection mode for vehicles ('Separate' or 'Combine')
+attacker_type: 'RL' # Type of attacker ('RL' or 'Fix')
+
+# Parameters for the 'Fix' attacker type (if used)
+fix_attacker_params:
+  cycle: 20
+  num_subchannels: 2
+
+# -- Resource Pool and Channel Settings --
+num_slots: 100 # Number of time slots in the resource pool
+num_subchannels: 5 # Number of subchannels in the resource pool
+
+# -- SINR Calculation Settings --
+use_sinr: True # Whether to use SINR for collision detection
+sinr_threshold: 0.0 # SINR threshold in dB for successful reception
+tx_power: 23.0 # Transmission power in dBm
+noise_power: -95.0 # Noise power in dBm
+use_simple_interference: False # Use a simplified interference model if True
+
+# -- RL Agent Specific Settings --
+# action_num: 2 # Number of resource blocks selected by each RL agent's action
+
+scenario: "my_v2v_env"
