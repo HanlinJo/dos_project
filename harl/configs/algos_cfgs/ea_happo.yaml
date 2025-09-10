@@ -131,6 +131,7 @@ algo:
   state_alpha: 0.01         # Weight for the MINE loss
   EA_alpha: 0.1             # Weight for the EA guidance loss
   tau: 0.005                # Coefficient for soft update
+  use_ea: True  # <-- ADD THIS LINE
 
 logger:
   # logging directory
