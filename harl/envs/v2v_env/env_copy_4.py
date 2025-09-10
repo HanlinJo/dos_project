@@ -584,17 +584,17 @@ class RLAttacker:
         """获取RL代理的当前状态 - 包含信道状态、上一动作和时间步"""
         # 1. 获取信道状态
         # 如果启用多智能体协作，状态将包含所有攻击者的视角
-        if self.sim.n_agents > 1 and self.sim.multi_agent_coordination:
-            all_resource_states = []
-            for attacker in self.sim.attackers:
-                # 每个攻击者都计算自己的20x5感知矩阵
-                all_resource_states.append(attacker.get_individual_resource_state(current_time))
-            # 堆叠成 (n_agents, 20, 5) 的形状
-            resource_state_matrix = np.stack(all_resource_states, axis=0)
-            resource_state_flat = resource_state_matrix.flatten()
-        else:
+        # if self.sim.n_agents > 1 and self.sim.multi_agent_coordination:
+        #     all_resource_states = []
+        #     for attacker in self.sim.attackers:
+        #         # 每个攻击者都计算自己的20x5感知矩阵
+        #         all_resource_states.append(attacker.get_individual_resource_state(current_time))
+        #     # 堆叠成 (n_agents, 20, 5) 的形状
+        #     resource_state_matrix = np.stack(all_resource_states, axis=0)
+        #     resource_state_flat = resource_state_matrix.flatten()
+        # else:
             # 原始逻辑：只包含自己的感知信息
-            resource_state_flat = self.get_individual_resource_state(current_time).flatten()
+        resource_state_flat = self.get_individual_resource_state(current_time).flatten()
         # <<< MODIFICATION END >>>
 
         # 2. 添加动作历史（最近5个动作）
@@ -1168,8 +1168,8 @@ class V2XRLEnvironment(gym.Env):
             # <<< MODIFICATION START >>>
             # 动态计算观测空间维度
             obs_dim = self.num_subchannels * 20  # 基础维度
-            if self.n_agents > 1 and self.multi_agent_coordination:
-                obs_dim *= self.n_agents # 如果协作，维度乘以智能体数量
+            # if self.n_agents > 1 and self.multi_agent_coordination:
+            #     obs_dim *= self.n_agents # 如果协作，维度乘以智能体数量
             
             # 加上动作历史和时间步的维度
             action_history_dim = 5 * 2

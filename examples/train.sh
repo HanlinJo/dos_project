@@ -1,1 +1,1 @@
-python train.py --algo happo --env smac --exp_name test
+python train.py --algo happo --env v2v --exp_name ea_happo_env --seed 42

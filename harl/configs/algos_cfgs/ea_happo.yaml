@@ -1,4 +1,7 @@
-# This is the configuration file for the HAPPO algorithm.
+# This is the configuration file for the EA_HAPPO algorithm.
+# It inherits parameters from HAPPO and adds EA-specific ones.
+
+# --- Original HAPPO Parameters ---
 seed:
   # whether to use the specified seed
   seed_specify: True
@@ -30,18 +33,6 @@ train:
   use_proper_time_limits: True
   # if set, load models from this directory; otherwise, randomly initialise the models
   model_dir: ~
-
-  use_ea: True              # 是否启用EA辅助训练的总开关
-  # pop_size: 10              # 种群大小 (不包括主Actor)
-  # state_alpha: 0.01         # MINE 损失的权重系数
-  # EA_alpha: 0.1             # EA 指导损失的权重系数
-  # tau: 0.005                # 目标网络软更新的系数
-  # pop_size: 4               # 种群大小 (除了主体Agent之外的个体数量)
-  # ea_evolution_interval: 10 # 每隔多少个训练周期（episode）进行一次种群评估和进化
-  # Org_alpha: 1.0            # 主体Agent策略梯度损失的权重
-  # EA_alpha: 0.5             # EA种群指导损失的权重
-  # state_alpha: 0.01         # 互信息（MINE）损失的权重
-  
 eval:
   # whether to use evaluation
   use_eval: True
@@ -56,9 +47,10 @@ render:
   render_episodes: 10
 model:
   # network parameters
-  # hidden sizes for mlp module in the network
+  # hidden size of actor and critic networks
   hidden_sizes: [128, 128]
-  # activation function, choose from sigmoid, tanh, relu, leaky_relu, selu
+  # initial standard deviation for action distribution
+  initial_std: 0.5
   activation_func: relu
   # whether to use feature normalization
   use_feature_normalization: True
@@ -118,16 +110,30 @@ algo:
   gae_lambda: 0.95
   # whether to use huber loss
   use_huber_loss: True
+  # whether to use popart
+  use_popart: False
+  # whether to use value normalization
+  use_valuenorm: True
+  # parameters for huber loss
+  huber_delta: 10.0
   # whether to use policy active masks
   use_policy_active_masks: True
-  # huber delta
-  huber_delta: 10.0
-  # method of aggregating the probability of multi-dimensional actions, choose from prod, mean
-  action_aggregation: prod
+  # whether to use feature normalization
+  use_feature_normalization: True
+  # action aggregation
+  action_aggregation: "prod"
   # whether to share parameter among actors
   share_param: False
   # whether to use a fixed optimisation order
   fixed_order: False
+
+  pop_size: 10              # Size of the actor population
+  state_alpha: 0.01         # Weight for the MINE loss
+  EA_alpha: 0.1             # Weight for the EA guidance loss
+  tau: 0.005                # Coefficient for soft update
+
 logger:
   # logging directory
   log_dir: "./results"
+# --- EA-specific Parameters ---
+# Add these new parameters for your EA_HAPPO algorithm
