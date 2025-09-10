@@ -30,6 +30,14 @@ train:
   use_proper_time_limits: True
   # if set, load models from this directory; otherwise, randomly initialise the models
   model_dir: ~
+
+  use_ea: True              # 是否启用EA辅助训练的总开关
+  pop_size: 4               # 种群大小 (除了主体Agent之外的个体数量)
+  ea_evolution_interval: 10 # 每隔多少个训练周期（episode）进行一次种群评估和进化
+  Org_alpha: 1.0            # 主体Agent策略梯度损失的权重
+  EA_alpha: 0.5             # EA种群指导损失的权重
+  state_alpha: 0.01         # 互信息（MINE）损失的权重
+  
 eval:
   # whether to use evaluation
   use_eval: True

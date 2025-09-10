@@ -7,7 +7,7 @@ communication_range: 320.0 # Communication range for vehicles in meters
 
 # -- Vehicle and Attacker Settings --
 num_vehicles: 20  # Number of normal vehicles
-num_attackers: 1  # Number of attackers
+num_attackers: 2  # Number of attackers
 vehicle_resource_mode: 'Combine' # Resource selection mode for vehicles ('Separate' or 'Combine')
 attacker_type: 'RL' # Type of attacker ('RL' or 'Fix')
 
