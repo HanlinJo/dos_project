@@ -94,23 +94,14 @@ class OnPolicyBaseRunner:
         print("action_space: ", self.envs.action_space)
 
         # actor
-        actor_args = {
-            "args": {**algo_args["model"], **algo_args["algo"]},
-            "device": self.device
-        }
-
-        # Conditionally add share_obs_space if use_ea is True in the config
-        if algo_args["algo"].get("use_ea", False):
-            actor_args["share_obs_space"] = self.envs.share_observation_space[0]
-
         if self.share_param:
             self.actor = []
-            # Add observation and action spaces for the shared agent
-            agent_args = actor_args.copy()
-            agent_args["obs_space"] = self.envs.observation_space[0]
-            agent_args["act_space"] = self.envs.action_space[0]
-            
-            agent = ALGO_REGISTRY[args["algo"]](**agent_args)
+            agent = ALGO_REGISTRY[args["algo"]](
+                {**algo_args["model"], **algo_args["algo"]},
+                self.envs.observation_space[0],
+                self.envs.action_space[0],
+                device=self.device,
+            )
             self.actor.append(agent)
             for agent_id in range(1, self.num_agents):
                 assert (
@@ -124,41 +115,13 @@ class OnPolicyBaseRunner:
         else:
             self.actor = []
             for agent_id in range(self.num_agents):
-                # Add observation and action spaces for each individual agent
-                agent_args = actor_args.copy()
-                agent_args["obs_space"] = self.envs.observation_space[agent_id]
-                agent_args["act_space"] = self.envs.action_space[agent_id]
-
-                agent = ALGO_REGISTRY[args["algo"]](**agent_args)
+                agent = ALGO_REGISTRY[args["algo"]](
+                    {**algo_args["model"], **algo_args["algo"]},
+                    self.envs.observation_space[agent_id],
+                    self.envs.action_space[agent_id],
+                    device=self.device,
+                )
                 self.actor.append(agent)
-        # if self.share_param:
-        #     self.actor = []
-        #     agent = ALGO_REGISTRY[args["algo"]](
-        #         {**algo_args["model"], **algo_args["algo"]},
-        #         self.envs.observation_space[0],
-        #         self.envs.action_space[0],
-        #         device=self.device,
-        #     )
-        #     self.actor.append(agent)
-        #     for agent_id in range(1, self.num_agents):
-        #         assert (
-        #             self.envs.observation_space[agent_id]
-        #             == self.envs.observation_space[0]
-        #         ), "Agents have heterogeneous observation spaces, parameter sharing is not valid."
-        #         assert (
-        #             self.envs.action_space[agent_id] == self.envs.action_space[0]
-        #         ), "Agents have heterogeneous action spaces, parameter sharing is not valid."
-        #         self.actor.append(self.actor[0])
-        # else:
-        #     self.actor = []
-        #     for agent_id in range(self.num_agents):
-        #         agent = ALGO_REGISTRY[args["algo"]](
-        #             {**algo_args["model"], **algo_args["algo"]},
-        #             self.envs.observation_space[agent_id],
-        #             self.envs.action_space[agent_id],
-        #             device=self.device,
-        #         )
-        #         self.actor.append(agent)
 
         if self.algo_args["render"]["use_render"] is False:  # train, not render
             self.actor_buffer = []

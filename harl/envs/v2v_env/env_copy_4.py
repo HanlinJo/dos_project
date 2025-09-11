@@ -1156,7 +1156,7 @@ class V2XRLEnvironment(gym.Env):
         self.attackers = []
         self._initialize_vehicles()
         self._initialize_attackers()
-
+        
         # MODIFICATION: Define observation and action spaces as lists for MARL
         # The action space is [Time Slot Index (0-19), Subchannel Index (0-3)]
         # self.action_space = [spaces.MultiDiscrete([20, 4]) for _ in range(self.n_agents)]

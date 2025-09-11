@@ -1,7 +1,4 @@
-# This is the configuration file for the EA_HAPPO algorithm.
-# It inherits parameters from HAPPO and adds EA-specific ones.
-
-# --- Original HAPPO Parameters ---
+# This is the configuration file for the HAPPO algorithm.
 seed:
   # whether to use the specified seed
   seed_specify: True
@@ -16,11 +13,11 @@ device:
   torch_threads: 4
 train:
   # number of parallel environments for training data collection
-  n_rollout_threads: 10
+  n_rollout_threads: 20
   # number of total training steps
-  num_env_steps: 20000000
+  num_env_steps: 10000000
   # number of steps per environment per training data collection
-  episode_length: 1000
+  episode_length: 200
   # logging interval
   log_interval: 5
   # evaluation interval
@@ -47,10 +44,9 @@ render:
   render_episodes: 10
 model:
   # network parameters
-  # hidden size of actor and critic networks
+  # hidden sizes for mlp module in the network
   hidden_sizes: [128, 128]
-  # initial standard deviation for action distribution
-  initial_std: 0.5
+  # activation function, choose from sigmoid, tanh, relu, leaky_relu, selu
   activation_func: relu
   # whether to use feature normalization
   use_feature_normalization: True
@@ -110,31 +106,29 @@ algo:
   gae_lambda: 0.95
   # whether to use huber loss
   use_huber_loss: True
-  # whether to use popart
-  use_popart: False
-  # whether to use value normalization
-  use_valuenorm: True
-  # parameters for huber loss
-  huber_delta: 10.0
   # whether to use policy active masks
   use_policy_active_masks: True
-  # whether to use feature normalization
-  use_feature_normalization: True
-  # action aggregation
-  action_aggregation: "prod"
+  # huber delta
+  huber_delta: 10.0
+  # method of aggregating the probability of multi-dimensional actions, choose from prod, mean
+  action_aggregation: prod
   # whether to share parameter among actors
   share_param: False
   # whether to use a fixed optimisation order
   fixed_order: False
 
-  pop_size: 10              # Size of the actor population
-  state_alpha: 0.01         # Weight for the MINE loss
-  EA_alpha: 0.1             # Weight for the EA guidance loss
-  tau: 0.005                # Coefficient for soft update
-  use_ea: True  # <-- ADD THIS LINE
+  # --- EA-HAPPO specific parameters ---
+  use_ea: True                # Whether to use EA to optimize HAPPO
+  pop_size: 10                # Population size for EA
+  elite_fraction: 0.2         # Fraction of elites to preserve
+  crossover_prob: 0.5         # Crossover probability
+  mutation_prob: 0.9          # Mutation probability
+  prob_reset_and_sup: 0.05    # Probability of super mutation and reset
+  frac: 0.1                   # Fraction of weights to mutate in a layer
+  EA_alpha: 0.5               # Weight of EA loss term
+  Org_alpha: 0.5              # Weight of original HAPPO loss term
+  state_alpha: 0.1            # Weight of state prediction loss (if used)
 
 logger:
   # logging directory
   log_dir: "./results"
-# --- EA-specific Parameters ---
-# Add these new parameters for your EA_HAPPO algorithm

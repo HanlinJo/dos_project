@@ -55,7 +55,7 @@ class EA_HA_Agent_W(nn.Module):
         self.tpdv = dict(dtype=torch.float32, device=device)
 
         self.act_dim = act_dim
-        self.hidden_size = args.hidden_size
+        self.hidden_size = args["hidden_size"]
 
         self.act = nn.Linear(self.hidden_size, self.act_dim)
 
