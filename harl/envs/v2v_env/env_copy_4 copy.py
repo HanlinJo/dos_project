@@ -161,7 +161,7 @@ class Message:
 class Vehicle:
     """表示具有V2X功能的车辆"""
 
-    def __init__(self, vehicle_id, initial_position, initial_velocity, sim, resource_selection_mode='Separate',enable_collision_triggered_reselection=False):
+    def __init__(self, vehicle_id, initial_position, initial_velocity, sim, resource_selection_mode='Combine',enable_collision_triggered_reselection=False):
         self.id = vehicle_id
         self.position = initial_position
         self.velocity = initial_velocity
@@ -461,6 +461,185 @@ class Vehicle:
         distance = np.linalg.norm(self.position - sender_position)
         return distance <= self.sim.communication_range
 
+# ADDITION START: New RLVehicle class
+class RLVehicle:
+    """Represents a V2X-enabled vehicle controlled by a Reinforcement Learning agent."""
+
+    def __init__(self, vehicle_id, initial_position, initial_velocity, sim):
+        self.id = vehicle_id
+        self.position = initial_position
+        self.velocity = initial_velocity
+        self.sim = sim
+
+        self.num_slots = sim.resource_pool.num_slots
+        self.num_subchannels = sim.resource_pool.num_subchannels
+
+        # RL-specific attributes
+        self.sensing_window_duration = 100  # 100ms sensing window
+        self.sensing_data = []
+        self.action_history = deque(maxlen=5)
+        self.current_resources = None
+        self.current_packet_id = 0
+        self.packets_sent = 0
+        self.packets_received = 0
+        self.packets_received_succeed = 0
+        self.collisions = 0
+        self.successful_transmissions = 0
+        self.prr = 0.0
+        self.expected_receptions = 0
+        self.successful_receptions = 0
+        self.total_faild = 0
+        
+    def reset(self):
+        """Resets the vehicle's state for a new episode."""
+        self.sensing_data = []
+        self.action_history.clear()
+        self.current_resources = None
+        self.current_packet_id = 0
+        self.packets_sent = 0
+        self.packets_received = 0
+        self.packets_received_succeed = 0
+        self.collisions = 0
+        self.successful_transmissions = 0
+        self.prr = 0.0
+        self.expected_receptions = 0
+        self.successful_receptions = 0
+        self.total_faild = 0    
+
+    def move(self, delta_time):
+        """Updates the vehicle's position based on its velocity."""
+        self.position = self.position + self.velocity * delta_time
+        # Boundary conditions
+        if self.position[0] >= 1000:
+            self.position[0] = 1000 - (self.position[0] - 1000)
+            self.velocity = -self.velocity
+            self.position[1] = 10.0
+        if self.position[0] <= 0:
+            self.position[0] = -self.position[0]
+            self.velocity = -self.velocity
+            self.position[1] = 5.0
+            
+    def _update_sensing_window(self, current_time):
+        """Updates the sensing window by removing old entries."""
+        sensing_window_start = current_time - self.sensing_window_duration
+        self.sensing_data = [data for data in self.sensing_data if data.timestamp >= sensing_window_start]
+
+    def add_sensing_data(self, slot_id, subchannel, pRsvp, sender_id, timestamp, sender_position, expected_receivers):
+        """Adds new sensing data."""
+        self.sensing_data.append(SensingData(
+            slot_id, subchannel, pRsvp, sender_id, timestamp, sender_position, expected_receivers
+        ))
+
+    def get_state(self, current_time):
+        """Gets the current state for the RL agent."""
+        self._update_sensing_window(current_time)
+        
+        # MODIFICATION START: State now covers the full 100-slot window
+        # State: Resource occupancy in the future 100ms window.
+        resource_state = np.zeros((100, self.num_subchannels))
+        current_slot = current_time % self.num_slots
+
+        for data in self.sensing_data:
+            # Calculate the relative offset from the current slot
+            slot_offset = (data.slot_id - current_slot + self.num_slots) % self.num_slots
+            
+            # The offset directly corresponds to the index in our 100-slot future view
+            if 0 <= slot_offset < 100:
+                if 0 <= data.subchannel < self.num_subchannels:
+                    # Use normalized distance as state value
+                    distance = np.linalg.norm(self.position - data.sender_position)
+                    normalized_distance = max(0, 1 - min(1, distance / self.sim.communication_range))
+                    # Update if the new data point is from a closer vehicle
+                    if normalized_distance > resource_state[slot_offset, data.subchannel]:
+                         resource_state[slot_offset, data.subchannel] = normalized_distance
+        
+        resource_state_flat = resource_state.flatten()
+        # MODIFICATION END
+        action_history_state = np.zeros(5)  # 最近5个动作
+        for i, action in enumerate(self.action_history):
+            if action is not None:
+                # 归一化动作值
+                action_norm = action[0] / 400  # slot_idx范围0-19
+                action_history_state[i] = action_norm
+        # 3. 添加时间步（归一化）
+        time_norm = np.array([current_time / self.sim.episode_duration])
+        # Normalize time
+        # time_norm = np.array([current_time / self.sim.episode_duration])
+
+        # Combine into full state
+        full_state = np.concatenate([resource_state_flat,action_history_state, time_norm])
+        return full_state.astype(np.float32)
+
+    def select_transmission_resources(self, action):
+        """Selects transmission resources based on the agent's action."""
+        # Action space: (96 slots) * (num_subchannels - 3 possible start channels for a block of 4)
+       
+        self.action_history.append(action)
+        num_subchannel_choices = 4
+        slot_idx_offset = action // num_subchannel_choices  # 0-95
+        start_subchannel = action % num_subchannel_choices   # 0-(N-4)
+
+        current_slot = self.sim.current_time % self.num_slots
+        absolute_slot = (current_slot + slot_idx_offset) % self.num_slots
+
+        # Select four adjacent subchannels
+        selected_resources = [ResourceInfo(absolute_slot, start_subchannel + i) for i in range(2)]
+        self.current_resources = selected_resources
+        self.current_packet_id += 1
+        return selected_resources
+
+    def send_packet(self, current_time):
+        """Sends a packet using the selected resources for the current timeslot."""
+        if not self.current_resources:
+            return None
+            
+        current_slot = current_time % self.num_slots
+        transmissions = []
+
+        # Check if any of the selected resources are for the current slot
+        if self.current_resources[0].slot_id == current_slot:
+            packet = Packet(self.id, current_time, self.position, self.current_packet_id, is_attack=False)
+            for resource in self.current_resources:
+                transmissions.append((packet, resource))
+            self.packets_sent += len(transmissions)
+            
+        return transmissions
+    
+    def calculate_reward(self, was_successful):
+        """Calculates the reward based on transmission outcome."""
+        if was_successful:
+            return 2.0  # Reward for successful transmission
+        else:
+            return -10.0 # Penalty for collision
+
+    def receive_packet(self, packet, resource, success):
+        """处理接收到的数据包 - 修改为始终添加感知数据"""
+        if hasattr(packet, 'is_attack') and packet.is_attack:
+            pRsvp = 100
+        else:
+            pRsvp = 100
+
+        self.add_sensing_data(
+            resource.slot_id,
+            resource.subchannel,
+            pRsvp,
+            packet.sender_id,
+            packet.timestamp,
+            packet.position,  # 新增发送者位置
+            packet.expected_receivers
+        )
+        if not packet.is_attack:
+            self.packets_received += 1
+        if not packet.is_attack and success:
+            self.packets_received_succeed += 1
+            return True
+        return False
+    
+    def should_receive_packet(self, sender_position):
+        """Determines if this vehicle should receive a packet from a sender."""
+        distance = np.linalg.norm(self.position - sender_position)
+        return distance <= self.sim.communication_range
+# ADDITION END
 
 class RLAttacker:
     """基于RL的攻击者"""
@@ -547,25 +726,17 @@ class RLAttacker:
             return tuple(a)
         return (a,)
 
-    def get_state(self, current_time):
-        """获取RL代理的当前状态 - 包含信道状态、上一动作和时间步"""
-        # 1. 获取基础信道状态（20ms窗口）
+    # <<< MODIFICATION START >>>
+    def get_individual_resource_state(self, current_time):
+        """获取单个攻击者的资源状态矩阵 (20x5)"""
         self._update_sensing_window(current_time)
-
-        # 创建资源状态矩阵 - 使用相对距离代替0/1 (20时隙 x 5子信道)
         resource_state = np.zeros((20, self.num_subchannels))
-
-        # 获取当前时隙
         current_slot = current_time % self.num_slots
         window_start = current_slot
         window_end = (current_slot + 20) % self.num_slots
-        # print("当前时隙:", current_slot, "窗口起始:", window_start, "窗口结束:", window_end)
 
-        # 遍历感知数据
         for sensing_data in self.sensing_data:
             slot_id = sensing_data.slot_id % self.num_slots
-
-            # 检查是否在当前20ms窗口内
             slot_in_window = False
             if window_start < window_end:
                 if window_start <= slot_id < window_end:
@@ -575,38 +746,35 @@ class RLAttacker:
                     slot_in_window = True
 
             if slot_in_window and 0 <= sensing_data.subchannel < self.num_subchannels:
-                # 计算窗口内的相对时隙索引 (0-19)
                 if window_start <= slot_id:
                     slot_index = slot_id - window_start
                 else:
                     slot_index = slot_id + (self.num_slots - window_start)
-
-                # 确保slot_index在0-19范围内
                 slot_index = slot_index % 20
 
-                # 从感知数据中获取发送者位置（不再需要从车辆列表中查找）
-                if hasattr(sensing_data, 'sender_position'):
-                    sender_position = sensing_data.sender_position
-                else:
-                    # 向后兼容：如果没有位置信息，尝试从车辆列表中查找
-                    sender = None
-                    for v in self.sim.vehicles + self.sim.attackers:
-                        if v.id == sensing_data.sender_id:
-                            sender = v
-                            break
-                    sender_position = sender.position if sender else np.array([0, 0])
-                # print(sender_position)
-                # 计算距离并归一化 (0-1范围，1表示非常近，0表示超出范围)
+                sender_position = sensing_data.sender_position
                 distance = np.linalg.norm(self.position - sender_position)
                 normalized_distance = max(0, 1 - min(1, distance / self.sim.communication_range))
-                # 保留最大距离值（表示最强的干扰源）
                 if normalized_distance > resource_state[slot_index, sensing_data.subchannel]:
                     resource_state[slot_index, sensing_data.subchannel] = normalized_distance
+        return resource_state
 
-        # 状态统计信息
-        occupied_resources = np.sum(resource_state > 0)
-        total_resources = 20 * self.num_subchannels
-        free_ratio = 1.0 - (occupied_resources / total_resources) if total_resources > 0 else 1.0
+    def get_state(self, current_time):
+        """获取RL代理的当前状态 - 包含信道状态、上一动作和时间步"""
+        # 1. 获取信道状态
+        # 如果启用多智能体协作，状态将包含所有攻击者的视角
+        # if self.sim.n_agents > 1 and self.sim.multi_agent_coordination:
+        #     all_resource_states = []
+        #     for attacker in self.sim.attackers:
+        #         # 每个攻击者都计算自己的20x5感知矩阵
+        #         all_resource_states.append(attacker.get_individual_resource_state(current_time))
+        #     # 堆叠成 (n_agents, 20, 5) 的形状
+        #     resource_state_matrix = np.stack(all_resource_states, axis=0)
+        #     resource_state_flat = resource_state_matrix.flatten()
+        # else:
+            # 原始逻辑：只包含自己的感知信息
+        resource_state_flat = self.get_individual_resource_state(current_time).flatten()
+        # <<< MODIFICATION END >>>
 
         # 2. 添加动作历史（最近5个动作）
         action_history_state = np.zeros(5 * 2)  # 5个动作，每个动作2个值（slot_idx, subchannel）
@@ -624,8 +792,8 @@ class RLAttacker:
 
         # 组合完整状态
         full_state = np.concatenate([
-            resource_state.flatten(),  # 信道状态 (20x5=100维)
-            action_history_state,      # 动作历史 (5*2=10维)
+            resource_state_flat,         # 信道状态
+            action_history_state,      # 动作历史 (10维)
             time_norm                   # 时间步 (1维)
         ])
 
@@ -681,6 +849,9 @@ class RLAttacker:
 
 
     def calculate_reward(self, collision_count, affect_vehicles):
+        # <<< MODIFICATION START >>>
+        # 注意：这个函数现在只用于单智能体或作为多智能体奖励的基础部分
+        # <<< MODIFICATION END >>>
         reward = 0.0
 
         # 1. 核心碰撞奖励（按受影响车辆数加权）
@@ -724,7 +895,7 @@ class RLAttacker:
             reward -= 3.0  # 未造成碰撞的惩罚
 
         self.last_attack_success_rate = current_success_rate
-        return np.clip(reward, -5.0, 15.0)
+        return np.clip(reward, -10.0, 15.0)
 
     def record_attack_success(self, collision_occurred):
         """记录攻击成功"""
@@ -764,11 +935,11 @@ class FixAttacker(Vehicle):
     """固定策略攻击者"""
 
     def __init__(self, attacker_id, initial_position, initial_velocity, sim,
-                 attack_cycle=20, num_subchannels=2, resource_selection_mode='Combine',attack_nearest=False,attack_most_and_nearest=False):
+                 attack_cycle=20, num_subchannels=5, resource_selection_mode='Combine',attack_nearest=False,attack_most_and_nearest=False):
         super().__init__(attacker_id, initial_position, initial_velocity, sim, resource_selection_mode)
         self.is_attack = True
         self.attack_cycle = attack_cycle
-        self.num_subchannels = num_subchannels
+        self.num_subchannels = self.sim.resource_pool.num_subchannels
         self.next_attack_time = 0
         self.attack_packets_sent = 0
         self.collisions_caused = 0
@@ -797,6 +968,7 @@ class FixAttacker(Vehicle):
         self.nearest_vehicle_resources = []
         self.best_target_vehicle_id = -1
         self.best_target_resources = []
+        self.next_selection_time = 0
 
     def reset(self):
         """重置攻击者状态"""
@@ -819,6 +991,8 @@ class FixAttacker(Vehicle):
         # 新增：重置最近车辆相关状态
         self.nearest_vehicle_id = -1
         self.nearest_vehicle_resources = []
+        self.next_selection_time = 0
+
 
     def _calculate_cycle_groups(self):
         """根据攻击周期计算时隙组"""
@@ -851,22 +1025,40 @@ class FixAttacker(Vehicle):
 
     def send_packet(self, current_time):
         """重写发送方法实现攻击逻辑"""
-        if self.attack_most_and_nearest:
-            # 攻击期望接收数最多且距离最近的车辆
-            self.current_packet_id += 1
-            return self._send_most_and_nearest_attack(current_time)
-        elif self.attack_nearest:
-            # 攻击最近车辆模式
-            self.current_packet_id += 1
-            return self._send_nearest_attack(current_time)
-        elif TARGETED_ATTACK_MODE:
-            # 目标攻击模式
-            self.current_packet_id += 1
-            return self._send_targeted_attack(current_time)
+        if TARGETED_ATTACK_MODE:
+            if self.attack_most_and_nearest:
+                # 攻击期望接收数最多且距离最近的车辆
+                self.current_packet_id += 1
+                return self._send_most_and_nearest_attack(current_time)
+            elif self.attack_nearest:
+                # 攻击最近车辆模式
+                self.current_packet_id += 1
+                return self._send_nearest_attack(current_time)
+            else:
+                self.current_packet_id += 1
+                return self._send_targeted_attack(current_time)
         else:
             # 周期组攻击模式
             return self._send_cycle_group_attack(current_time)
 
+    def select_future_resource(self, current_time):
+        self._update_sensing_window(current_time)
+        selection_window = self._create_selection_window(current_time)
+
+        # 创建已占用资源集合
+        occupied_resources = set()
+        for data in self.sensing_data:
+            resource_key = (data.slot_id, data.subchannel)
+            occupied_resources.add(resource_key)
+
+        # 根据模式选择资源
+        if self.resource_selection_mode == 'Combine':
+            selected_resources = self._select_combined_resources(selection_window, occupied_resources)
+        else:  # Separate模式
+            selected_resources = self._select_separate_resources(selection_window, occupied_resources)
+            
+        return selected_resources
+    
     def _send_most_and_nearest_attack(self, current_time):
         """执行攻击期望接收数最多且距离最近的车辆"""
         # 更新最佳目标车辆信息
@@ -983,13 +1175,65 @@ class FixAttacker(Vehicle):
         self.has_transmitted = True
 
         return transmissions
+    
+    def _create_selection_window(self, current_time):
+        """创建选择窗口 (T1=4到T2=100)"""
+        selection_window = []
+        current_slot = current_time % self.num_slots
+        start_slot = current_slot
+        end_slot = (start_slot + 20) % self.num_slots
 
+        if start_slot < end_slot:
+            slots = range(start_slot, end_slot)
+        else:
+            slots = list(range(start_slot, self.num_slots)) + list(range(0, end_slot))
+
+        for slot in slots:
+            for subchannel in range(self.num_subchannels):
+                selection_window.append(ResourceInfo(slot, subchannel))
+
+        return selection_window
+    
+    def _select_combined_resources(self, selection_window, occupied_resources):
+        """Combine模式：选择同一时隙的两个相邻子信道"""
+        slot_resources = defaultdict(list)
+        for resource in selection_window:
+            slot_resources[resource.slot_id].append(resource)
+
+        valid_slots = []
+        for slot_id, resources in slot_resources.items():
+            free_subchannels = [r.subchannel for r in resources
+                               if (slot_id, r.subchannel) not in occupied_resources]
+
+            adjacent_pairs = []
+            for i in range(self.num_subchannels - 1):
+                if i in free_subchannels and (i+1) in free_subchannels:
+                    adjacent_pairs.append((i, i+1))
+
+            if adjacent_pairs:
+                valid_slots.append((slot_id, adjacent_pairs))
+
+        if valid_slots:
+            slot_id, adjacent_pairs = random.choice(valid_slots)
+            sc1, sc2 = random.choice(adjacent_pairs)
+            return [ResourceInfo(slot_id, sc1), ResourceInfo(slot_id, sc2)]
+
+        if slot_resources:
+            slot_id = random.choice(list(slot_resources.keys()))
+            sc_pair = random.choice([(i, i+1) for i in range(self.num_subchannels - 1)])
+            sc1, sc2 = sc_pair
+            return [ResourceInfo(slot_id, sc1), ResourceInfo(slot_id, sc2)]
+
+        return []
+    
     def _send_targeted_attack(self, current_time):
         """执行目标侧链攻击模式 - 改进版"""
 
         current_slot = current_time % self.num_slots
         transmissions = []
-
+        # print(self.targeted_resources.slot_id,self.targeted_resources.subchannel)
+        # print(current_time)
+        # exit(0)
         for resource in self.targeted_resources:
             if resource.slot_id == current_slot:
                 packet = Packet(self.id, current_time, self.position, self.current_packet_id, is_attack=True)
@@ -1070,7 +1314,7 @@ class FixAttacker(Vehicle):
         for data in self.sensing_data:
             if data.sender_id == self.target_vehicle_id:
                 target_resources.append((data.timestamp, data))
-
+        # print(self.sensing_data)
         # 有足够目标车辆数据
         if len(target_resources) >= 2:
             self.targeted_resources = []
@@ -1133,10 +1377,21 @@ class V2XRLEnvironment(gym.Env):
         self.use_sinr = kwargs.get('use_sinr', True)
         self.sinr_threshold = kwargs.get('sinr_threshold', 0.0)
         self.use_simple_interference = kwargs.get('use_simple_interference', False)
+        # <<< MODIFICATION START >>>
+        # ADDITION START: New parameters for RLVehicle mode
+        self.use_rl_vehicles = kwargs.get('use_rl_vehicles', False)
+        if self.use_rl_vehicles:
+            self.step_time = 100
+            self.n_agents = self.num_vehicles
+            self.num_agents = self.num_vehicles
+        else:
+            self.step_time = 20
+            self.n_agents = self.num_attackers
+            self.num_agents = self.num_attackers
+        # ADDITION END
 
-        # MODIFICATION: Set number of agents for MARL compatibility
-        self.n_agents = self.num_attackers
-        self.num_agents = self.num_attackers # Alias for compatibility with some frameworks
+        self.multi_agent_coordination = True if self.n_agents > 1 else False
+        # <<< MODIFICATION END >>>
 
         self.total_resources = self.num_slots * self.num_subchannels
         self.step_count = 0
@@ -1153,38 +1408,49 @@ class V2XRLEnvironment(gym.Env):
 
         self.recent_collision_queue = deque(maxlen=100)
         self.recent_collision_rate = 0.0
-
+        self.print_detail = False
         # Initialize simulation components
         self.vehicles = []
         self.attackers = []
         self._initialize_vehicles()
         self._initialize_attackers()
+        
+        # MODIFICATION: Define observation and action spaces based on mode
+        if self.use_rl_vehicles:
+            # MODIFICATION START: Action and Observation spaces updated for 100 slots
+            # Action Space for RLVehicle: Discrete action to select slot and starting subchannel
+            # 100 slots * (num_subchannels - 3) starting subchannels
+            num_starts_per_slot = self.num_subchannels - 1
+            if num_starts_per_slot <= 0:
+                 raise ValueError("num_subchannels must be greater than 3 for RLVehicle action space.")
+            total_actions = 100 * num_starts_per_slot
+            self.action_space = [spaces.Discrete(total_actions) for _ in range(self.n_agents)]
+            action_history_dim = 5
+            # Observation Space for RLVehicle
+            # 100 slots * num_subchannels + 1 for time
+            obs_dim = (100 * self.num_subchannels)+ action_history_dim + 1
+            self.observation_space = [
+                spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+                for _ in range(self.n_agents)
+            ]
+            # MODIFICATION END
+        else: # Original RLAttacker logic
+            total_actions = 20 * 4
+            self.action_space = [spaces.Discrete(total_actions) for _ in range(self.n_agents)]
 
-        # MODIFICATION: Define observation and action spaces as lists for MARL
-        # The action space is [Time Slot Index (0-19), Subchannel Index (0-3)]
-        # self.action_space = [spaces.MultiDiscrete([20, 4]) for _ in range(self.n_agents)]
-        total_actions = 20 * 4
-        self.action_space = [spaces.Discrete(total_actions) for _ in range(self.n_agents)]
+            if self.attacker_type == 'RL' and self.attackers:
+                obs_dim = self.num_subchannels * 20
+                action_history_dim = 5 * 2
+                time_dim = 1
+                final_obs_dim = obs_dim + action_history_dim + time_dim
+            else:
+                final_obs_dim = 1
 
-        # Get a sample observation to define the space dimensions
-        if self.attacker_type == 'RL' and self.attackers:
-            sample_obs = self.attackers[0].get_state(0)
-            obs_dim = sample_obs.shape[0]
-        else:
-            obs_dim = 1 # Placeholder if no RL attackers
+            self.observation_space = [
+                spaces.Box(low=-np.inf, high=np.inf, shape=(final_obs_dim,), dtype=np.float32)
+                for _ in range(self.n_agents)
+            ]
 
-        self.observation_space = [
-            spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
-            for _ in range(self.n_agents)
-        ]
-
-        # Define the shared observation space (global state)
-        # Here, we concatenate all individual observations
-        # share_obs_dim = obs_dim * self.n_agents
-        # self.share_observation_space = [
-        #      spaces.Box(low=-np.inf, high=np.inf, shape=(share_obs_dim,), dtype=np.float32)
-        #      for _ in range(self.n_agents)
-        # ]
         share_obs_dim = self.num_slots * self.num_subchannels
         self.share_observation_space = [
              spaces.Box(low=0.0, high=1.0, shape=(share_obs_dim,), dtype=np.float32)
@@ -1197,6 +1463,8 @@ class V2XRLEnvironment(gym.Env):
         self.resource_transmission_count = 0
         self.attack_effect_records = []
         self.verbose_attack_output = True
+        self.total_expected_packets = 0
+        self.total_received_packets = 0
         self.reset_stats()
 
 
@@ -1417,6 +1685,24 @@ class V2XRLEnvironment(gym.Env):
         plt.pause(0.001)
         self.fig.canvas.flush_events()  # 确保GUI事件被处理
 
+    def get_episode_stats(self):
+        """获取当前轮的统计信息"""
+        vehicle_prrs = self.get_vehicle_prrs()
+
+        return {
+            'total_collisions': self.collision_count,
+            'total_transmissions': self.transmission_count,
+            'prr': self._calculate_current_prr(),
+            'attack_success_rate': self.total_attack_success / max(1, self.attack_transmission_count),
+            'collision_rate': self.collision_count / max(1, self.resource_transmission_count),
+            'message_failures': self.message_failures,
+            'resource_block_attacks': self.resource_block_attacks,
+            'resource_block_collisions': self.resource_block_collisions,
+            'vehicle_prrs': vehicle_prrs,
+            'attack_transmission_count':self.attack_transmission_count,
+            'attack_count':self.attack_transmission_count,
+            'step_count': self.step_count
+        }
     # MODIFICATION: Complete refactor of the reset method for MARL interface
     def reset(self):
         """
@@ -1424,6 +1710,7 @@ class V2XRLEnvironment(gym.Env):
         Returns:
             (obs, state, avail_actions)
         """
+        # self.get_episode_stats()
         self.current_time = 0
         self.recent_collision_queue.clear()
         self.recent_collision_rate = 0.0
@@ -1448,27 +1735,28 @@ class V2XRLEnvironment(gym.Env):
 
         # Get observations for each agent
         obs = []
-        for attacker in self.attackers:
-            if self.attacker_type == 'RL':
-                obs.append(attacker.get_state(self.current_time))
-            else:
-                # Provide a zero-filled observation if not an RL agent
-                obs.append(np.zeros(self.observation_space[0].shape, dtype=np.float32))
+        # ADDITION START: Handle obs for RLVehicle and RLAttacker
+        if self.use_rl_vehicles:
+            for vehicle in self.vehicles:
+                obs.append(vehicle.get_state(self.current_time))
+        else:
+            for attacker in self.attackers:
+                if self.attacker_type == 'RL':
+                    obs.append(attacker.get_state(self.current_time))
+                else:
+                    # Provide a zero-filled observation if not an RL agent
+                    obs.append(np.zeros(self.observation_space[0].shape, dtype=np.float32))
+        # ADDITION END
 
         # Create global state by concatenating individual observations
         global_state = self._get_global_state()
         # The state vector is the same for all agents
         state = [global_state for _ in range(self.n_agents)]
 
-        # Available actions: In this env, all actions are always available.
-        # We create a placeholder list. Some frameworks might expect None.
-        # avail_actions = [np.ones(1) for _ in range(self.n_agents)]
-        # avail_actions = [None for _ in range(self.n_agents)]
         total_actions = self.action_space[0].n
         avail_actions = [np.ones(total_actions, dtype=np.float32) for _ in range(self.n_agents)]
         return obs, state, avail_actions
 
-    # MODIFICATION: Complete refactor of the step method for MARL interface
     def step(self, actions):
         """
         Executes one time step in the environment.
@@ -1481,76 +1769,118 @@ class V2XRLEnvironment(gym.Env):
         message_failures_before = self.message_failures
 
         # --- Action Phase ---
+        attacker_action_resources = defaultdict(list)
+        rl_vehicle_transmission_status = {} # ADDITION: To track RLVehicle outcomes
+        # MODIFICATION: Handle actions for both RLVehicle and RLAttacker
+        if self.use_rl_vehicles:
+            for i, vehicle in enumerate(self.vehicles):
+                vehicle.select_transmission_resources(actions[i])
+    
         # Each RL attacker selects its resources based on its action
         for i, attacker in enumerate(self.attackers):
             if isinstance(attacker, RLAttacker):
-                # actions[i] contains the action for the i-th attacker
-                attacker.current_resources, attacker.resources_changed = attacker.select_attack_resources(actions[i])
+                resources, changed = attacker.select_attack_resources(actions[i])
+                attacker.current_resources = resources
+                attacker.resources_changed = changed
+                attacker_action_resources[attacker.id] = resources
             elif isinstance(attacker, FixAttacker):
-                # Fixed attackers follow their own logic, no action needed
                 if not TARGETED_ATTACK_MODE:
                     attacker.current_resources = attacker.select_future_resource(self.current_time)
+                    # print(self.current_time,attacker.current_resources[0].slot_id,attacker.current_resources[0].subchannel,attacker.current_resources[1].slot_id,attacker.current_resources[1].subchannel)
                 else:
                     attacker._update_target_resources()
+         
             attacker.sent_resources_count = 0
-
-        # --- Simulation Phase (20ms) ---
+        
+        # if render:
+        #     self._update_resource_grid()
+        # --- Simulation Phase ---
         total_collision_caused_due_to_attack = 0
-        affect_vehicles_set = set()
+        total_attacker_impact = defaultdict(set)
+        rl_vehicle_transmission_status = {} # ADDITION: To track RLVehicle outcomes
 
-        for vehicle in self.vehicles:
-            vehicle._update_sensing_window(self.current_time)
-            vehicle.handle_periodic_resource_reselection(self.current_time)
+        # MODIFICATION: Use self.step_time for the simulation loop
+        if not self.use_rl_vehicles: # Original behavior for normal vehicles
+             for vehicle in self.vehicles:
+                vehicle._update_sensing_window(self.current_time)
+                vehicle.handle_periodic_resource_reselection(self.current_time)
 
-        for _ in range(20):
+        for _ in range(self.step_time):
+            # All entities move each millisecond
             for vehicle in self.vehicles:
-                vehicle.move(0.001) # Assuming delta_time should be 1ms (0.001s)
+                vehicle.move(0.001)
             for attacker in self.attackers:
                 attacker.move(0.001)
 
-            step_collision, affect_vehicles = self._process_transmissions_with_rl()
+            # Process transmissions and get detailed collision info
+            step_collision, attacker_impact_map, rl_vehicle_status_update = self._process_transmissions_with_rl()
             total_collision_caused_due_to_attack += step_collision
-            affect_vehicles_set.update(affect_vehicles)
+            for attacker_id, affected_vehicles in attacker_impact_map.items():
+                total_attacker_impact[attacker_id].update(affected_vehicles)
+            
+            # ADDITION: Update RLVehicle status from the step
+            rl_vehicle_transmission_status.update(rl_vehicle_status_update)
 
             self.current_time += 1
-
+            if(self.current_time%20==0):
+                for attacker in self.attackers:
+                    if not isinstance(attacker, RLAttacker):
+                        attacker.select_future_resource(self.current_time)
+                        attacker.has_transmitted = False
+            # if(self.current_time%5==0):
+            #     self.render()
         # --- Observation and Reward Phase ---
-        # Get next observation for each agent
         next_obs = []
-        for attacker in self.attackers:
-            if self.attacker_type == 'RL':
-                next_obs.append(attacker.get_state(self.current_time))
-            else:
-                next_obs.append(np.zeros(self.observation_space[0].shape, dtype=np.float32))
+        # MODIFICATION: Get next obs for the correct agent type
+        if self.use_rl_vehicles:
+            for vehicle in self.vehicles:
+                next_obs.append(vehicle.get_state(self.current_time))
+        else:
+            for attacker in self.attackers:
+                if self.attacker_type == 'RL':
+                    next_obs.append(attacker.get_state(self.current_time))
+                else:
+                    next_obs.append(np.zeros(self.observation_space[0].shape, dtype=np.float32))
 
-        # Create next global state
         next_global_state = self._get_global_state()
         next_state = [next_global_state for _ in range(self.n_agents)]
 
-        # Calculate a shared reward for the team of attackers
-        # The reward function is called on the first attacker but uses global info
-        team_reward = 0
-        if self.attacker_type == 'RL' and self.attackers:
-            team_reward = self.attackers[0].calculate_reward(total_collision_caused_due_to_attack, affect_vehicles_set)
+        # --- Reward Calculation ---
+        # MODIFICATION: Calculate rewards based on mode
+        if self.use_rl_vehicles:
+            agent_rewards = []
+            vehicle_success = sum(1 for success in rl_vehicle_transmission_status.values() if success)
+            
+            # 2. Calculate the cooperative reward based on the user's formula
+            cooperative_reward = (vehicle_success - 15.0) * 1.0
+            
+            for i, vehicle in enumerate(self.vehicles):
+                # Default to collision (False) if no status was recorded for this agent in this step
+                was_successful = rl_vehicle_transmission_status.get(vehicle.id, False)
+                reward = vehicle.calculate_reward(was_successful)
+                reward += cooperative_reward
+                agent_rewards.append(reward)
+            rewards = [[r] for r in agent_rewards]
+        else: # Original team reward logic for RLAttacker
+            team_reward = 0
+            if self.attacker_type == 'RL' and self.attackers:
+                all_affected_vehicles = set.union(*total_attacker_impact.values()) if total_attacker_impact else set()
+                base_reward = self.attackers[0].calculate_reward(total_collision_caused_due_to_attack, all_affected_vehicles)
+                team_reward += base_reward
+                if self.n_agents > 1 and self.multi_agent_coordination:
+                    resource_list = [res for res_list in attacker_action_resources.values() for res in res_list]
+                    num_overlaps = (len(resource_list) - len(set(resource_list))) / 2
+                    overlap_penalty = 3.0
+                    team_reward -= num_overlaps * overlap_penalty
+                    successful_attackers_count = len(total_attacker_impact)
+                    if successful_attackers_count >= 2:
+                        coordination_bonus = 3.0
+                        team_reward += coordination_bonus
+            rewards = [[team_reward] for _ in range(self.n_agents)]
         
-        # Format rewards for MARL: [[r1], [r2], ...]
-        rewards = [[team_reward] for _ in range(self.n_agents)]
-
-        # Check for episode termination
         done = self.current_time >= self.episode_duration
-        # Format dones for MARL: [d1, d2, ...]
         dones = [done for _ in range(self.n_agents)]
-
-        # info = {
-        #     'total_collisions': self.collision_count,
-        #     'attack_success_rate': self.total_attack_success / max(1, self.attack_transmission_count),
-        #     'prr': self._calculate_current_prr(),
-        #     'message_failures': self.message_failures - message_failures_before,
-        #     'resource_block_attacks': self.resource_block_attacks,
-        #     'resource_block_collisions': self.resource_block_collisions,
-        #     'collision_rate': self.collision_count / max(1, self.transmission_count)
-        # }
-        # Create info dictionary
+        # print(total_collision_caused_due_to_attack, self.collision_count, self.total_attack_success, self.attack_transmission_count, self.message_failures, self.transmission_count)
         info = {
             'collisions_caused_this_step': total_collision_caused_due_to_attack,
             'total_collisions': self.collision_count,
@@ -1559,62 +1889,67 @@ class V2XRLEnvironment(gym.Env):
             'message_failures': self.message_failures,
             'collision_rate': self.collision_count / max(1, self.transmission_count)
         }
-        # Format infos for MARL: [i1, i2, ...]
         infos = [info for _ in range(self.n_agents)]
 
-        # # Get available actions for the next step
-        # avail_actions = [np.ones(1) for _ in range(self.n_agents)]
-        # total_actions = self.action_space[0].nvec.prod() 
-        # # 为每个智能体创建一个全为1的向量，表示所有动作都可用
-        # avail_actions = [np.ones(total_actions, dtype=np.float32) for _ in range(self.n_agents)]
         total_actions = self.action_space[0].n
         avail_actions = [np.ones(total_actions, dtype=np.float32) for _ in range(self.n_agents)]
-        # avail_actions = [None for _ in range(self.n_agents)]
+        
         return next_obs, next_state, rewards, dones, infos, avail_actions
 
     def _process_transmissions_with_rl(self):
         """处理传输，包括RL引导的攻击"""
         transmissions = []
         attack_transmissions = []
-        # current_slot = self.current_time % self.num_slots
         attacker_sent = False
 
+        # MODIFICATION: Collect transmissions from RLVehicle or normal Vehicle
         for vehicle in self.vehicles:
             tx_result = vehicle.send_packet(self.current_time)
+            # print("发送者正常发送")
             if tx_result:
+                # In RLVehicle mode, a "packet" is 4 resources. In normal mode, it's 1 or 2.
+                # The logic here handles both cases as tx_result is a list of (packet, resource) tuples.
                 for packet, resource in tx_result:
                     transmissions.append((vehicle, packet, resource))
                     self.transmission_count += 1
-
+        # print(self.attackers)
+        # exit(0)
         for attacker in self.attackers:
             if isinstance(attacker, RLAttacker):
-                # 使用攻击者自己的send_attack_packet_with_action方法
                 attack_result = attacker.send_attack_packet_with_action(self.current_time)
             else:
+                
                 attack_result = attacker.send_packet(self.current_time)
+                attacker.current_resources = None
             if attack_result:
+                # print("攻击者正常发送,当前时隙:",self.current_time)
+                # exit(0)
                 attacker_sent = True
+                # print("我发了")
                 for attack_packet, resource in attack_result:
                     attack_transmissions.append((attacker, attack_packet, resource))
                     self.attack_transmission_count += 1
-                    # Assuming the first attacker is the one we track for certain stats
-                    if self.attackers:
-                        self.attackers[0].attack_packets_sent += 1
+                    
+                    attacker.attack_packets_sent += 1
 
         all_transmissions = transmissions + attack_transmissions
-        step_collision = 0
-        affect_vehicles = set()
-        if all_transmissions:
-            collision_info = self._handle_transmissions_with_enhanced_sinr(all_transmissions)
-            step_collision = collision_info.get('collisions_caused', 0)
-            affect_vehicles = collision_info.get('attacker_resource_from_vehicles', set())
-            if attacker_sent and self.attacker_type == 'RL':
-                collision_occurred = step_collision > 0
-                if collision_occurred and self.attackers:
-                    # self.attackers[0].attack_success_this_step = True
-                    self.attackers[0].attack_success_count += 1
+        total_step_collision = 0
+        total_attacker_impact_map = defaultdict(set)
+        rl_vehicle_transmission_status = {} # ADDITION
 
-        return step_collision,affect_vehicles
+        if all_transmissions:
+            # MODIFICATION: _handle_transmissions now returns RLVehicle status
+            collision_info, rl_vehicle_transmission_status = self._handle_transmissions_with_enhanced_sinr(all_transmissions)
+            total_step_collision = collision_info.get('collisions_caused', 0)
+            total_attacker_impact_map = collision_info.get('attacker_impact_map', defaultdict(set))
+            
+            if attacker_sent and self.attacker_type == 'RL':
+                collision_occurred = total_step_collision > 0
+                if collision_occurred and self.attackers:
+                    self.attackers[0].attack_success_count += 1
+        
+        # MODIFICATION: Return the new status dictionary
+        return total_step_collision, total_attacker_impact_map, rl_vehicle_transmission_status
 
 
     def _distance(self, pos1, pos2):
@@ -1623,56 +1958,69 @@ class V2XRLEnvironment(gym.Env):
 
     def _handle_transmissions_with_enhanced_sinr(self, transmissions):
         """处理传输并使用SINR进行碰撞检测"""
-        # 按时隙分组
         tx_by_slot = defaultdict(list)
         for sender, packet, resource in transmissions:
             tx_by_slot[resource.slot_id].append((sender, packet, resource))
-            # print(sender.id)
-        collision_info = {'collisions_caused': 0,'attacker_resource_from_vehicles': set()}
-        # 处理每个时隙的传输
+            
+        collision_info = {
+            'collisions_caused': 0,
+            'attacker_impact_map': defaultdict(set)
+        }
+        # ADDITION: Track RLVehicle transmission status for rewards
+        rl_vehicle_transmission_status = {}
+
         for slot_id, slot_transmissions in tx_by_slot.items():
-            # 检测碰撞：记录每个子信道的使用情况
             subchannel_usage = defaultdict(list)
             for sender, packet, resource in slot_transmissions:
                 subchannel_usage[resource.subchannel].append((sender, packet, resource))
 
-            # 消息状态跟踪 - 重构为接收者粒度
-            # 格式: {(sender_id, packet_id, receiver_id): status}
             receiver_message_status = defaultdict(lambda: {
-                'success': False,
+                'success': True,
                 'resources_used': 0,
                 'failed_resources': set()
             })
             slot_sinr_records = []
-            # 处理每个子信道
+
             for subchannel, users in subchannel_usage.items():
-                # 检查是否有攻击者参与
+                # ADDITION START: Simplified collision logic for RLVehicle
+                if self.use_rl_vehicles:
+                    # Collision for an RLVehicle occurs if more than one entity uses the resource
+                    if len(users) > 1:
+                        for sender, _, _ in users:
+                            if isinstance(sender, RLVehicle):
+                                # Mark as collided (False means not successful)
+                                rl_vehicle_transmission_status[sender.id] = False
+                                # self.collision_count +=1
+                    else: # Only one user, transmission is successful
+                        sender, _, _ = users[0]
+                        if isinstance(sender, RLVehicle):
+                            rl_vehicle_transmission_status[sender.id] = True
+                    # Skip the complex SINR calculation for RLVehicle mode
+                    # continue
+                # ADDITION END
+
+                # --- Original SINR and Attacker logic below ---
                 has_attacker = any(isinstance(sender, (RLAttacker, FixAttacker)) for sender, _, _ in users)
                 has_normal = any(not isinstance(sender, (RLAttacker, FixAttacker)) for sender, _, _ in users)
-                normal_users = [user for user in users if not isinstance(user[0], (RLAttacker, FixAttacker))]
+                normal_users = [user for user in users if not isinstance(user, (RLAttacker, FixAttacker))]
                 bingo = False
-                # if has_attacker:
-                #     for attacker in self.attackers:
-                #         attacker.attack_packets_sent += 1
-                        # self.attack_transmission_count += 1
+                
                 if has_attacker:
                     if self.attackers:
                         self.attackers[0].attack_success_this_step = False
                     if has_normal:
-                        collision_info['collisions_caused'] += len(normal_users)
-                        collision_info['attacker_resource_from_vehicles'].update(
-                            sender[0].id for sender in normal_users
-                       )
-                        # print(collision_info['attacker_resource_from_vehicles'])
-                        # print("==")
+                        attackers_on_resource = [sender for sender, _, _ in users if isinstance(sender, (RLAttacker, FixAttacker))]
+                        normal_vehicles_on_resource = [sender for sender, _, _ in users if not isinstance(sender, (RLAttacker, FixAttacker))]
 
+                        collision_info['collisions_caused'] += len(normal_vehicles_on_resource)
+                        
+                        for attacker in attackers_on_resource:
+                            for vehicle in normal_vehicles_on_resource:
+                                collision_info['attacker_impact_map'][attacker.id].add(vehicle.id)
 
-                # 传统碰撞检测：多个发送者使用同一资源块
                 collision_occurred = len(normal_users) > 1
 
-                # SINR-based接收检测
                 if self.use_sinr:
-                    # 记录该资源块的信息
                     resource_record = {
                         'time': self.current_time,
                         'resource': (slot_id, subchannel),
@@ -1680,7 +2028,6 @@ class V2XRLEnvironment(gym.Env):
                         'receivers': []
                     }
 
-                    # 记录发送者信息
                     for sender, packet, resource in users:
                         if len(users)>1:
                             if not isinstance(sender, (RLAttacker, FixAttacker)):
@@ -1690,9 +2037,7 @@ class V2XRLEnvironment(gym.Env):
                             'sender_position': sender.position.tolist(),
                             'is_attacker': isinstance(sender, (RLAttacker, FixAttacker))
                         })
-                    # 对每个接收者计算SINR
                     for receiver in self.vehicles:
-                        # 只考虑不是发送者的接收者
                         receiver_sinr_info = {
                             'receiver_id': receiver.id,
                             'receiver_position': receiver.position.tolist(),
@@ -1705,6 +2050,9 @@ class V2XRLEnvironment(gym.Env):
                             for sender, packet, resource in users:
 
                                 if receiver.should_receive_packet(sender.position):
+                                    msg_key = (sender.id, packet.packet_id, receiver.id)
+                                    receiver_message_status[msg_key]['success'] = True
+                                    receiver_message_status[msg_key]['resources_used'] += 1
                                     interferers_pos = []
                                     has_attack_in_interferers = False
                                     for other_sender, _, _ in users:
@@ -1712,7 +2060,6 @@ class V2XRLEnvironment(gym.Env):
                                             interferers_pos.append(other_sender.position)
                                             if isinstance(other_sender, (RLAttacker, FixAttacker)):
                                                 has_attack_in_interferers= True
-                                    # # 计算SINR
                                     if self.use_simple_interference:
                                             sinr = self.sinr_calculator.calculate_sinr_simple(
                                                 receiver.position, sender.position, len(interferers_pos),self.attacker_tx_power
@@ -1723,38 +2070,42 @@ class V2XRLEnvironment(gym.Env):
                                             )
 
                                     distance = self._distance(receiver.position, sender.position)
-                                    # 如果SINR高于阈值，标记为成功接收
                                     success = sinr >= self.sinr_threshold
 
                                     self.resource_transmission_count += 1
-                                    if success:
-                                        msg_key = (sender.id, packet.packet_id, receiver.id)
-                                        receiver_message_status[msg_key]['success'] = True
-                                    else:
-                                        # 记录失败原因
+                                    if self.print_detail:
+                                        all_senders_on_resource = [s.id for s, p, r in users]
+                                        status_str = "成功" if success else "失败"
+                                        resource_str = f"({resource.slot_id}, {resource.subchannel})"
+                                        
+                                        print(f"在时间 {self.current_time}ms, 车辆 {all_senders_on_resource} 选择了 {resource_str} 资源, "
+                                              f"车辆 {receiver.id} 接收车辆 {sender.id} 的信息, "
+                                              f"SINR={sinr:.2f}dB, 接受状态: {status_str}")
+
+                                    if not success:
                                         if not isinstance(sender, (RLAttacker, FixAttacker)):
                                             self.collision_count += 1
                                             receiver.total_faild += 1
                                             bingo = True
-                                            # print("bingo","sender: ",sender.id)
 
-                                        msg_key = (sender.id, packet.packet_id, receiver.id)
+                                        # msg_key = (sender.id, packet.packet_id, receiver.id)
                                         receiver_message_status[msg_key]['failed_resources'].add(receiver.id)
+                                        receiver_message_status[msg_key]['success'] = False
 
                                         if has_attacker and self.attackers:
-                                            self.attackers[0].attack_success_this_step = True
+                                            for sender, _, _ in users:
+                                                if isinstance(sender, (RLAttacker, FixAttacker)):
+                                                    sender.attack_success_this_step = True
 
-                                    if isinstance(receiver, Vehicle):
+                                    if isinstance(receiver, (Vehicle, RLVehicle)):
                                             receiver.receive_packet(packet, resource, success)
 
                                     receiver_sinr_info['sinr_values'].append(sinr)
                                     receiver_sinr_info['sender_ids'].append(sender.id)
                                     receiver_sinr_info['distances'].append(distance)
 
-                        # 只有当接收者有SINR记录时才添加
                         if receiver_sinr_info['sinr_values']:
                             resource_record['receivers'].append(receiver_sinr_info)
-                    # 保存资源块记录
                     if resource_record['receivers']:
                         slot_sinr_records.append(resource_record)
 
@@ -1772,45 +2123,43 @@ class V2XRLEnvironment(gym.Env):
                                         packet.position,
                                         packet.expected_receivers
                                     )
-                # This logic block seems redundant or misplaced, commenting out
-                # if has_attacker and has_normal and bingo:
-                #     pass
+                
+                # for sender, packet, resource in normal_users:
+                #     expected_receiver_ids = []
+                #     for vehicle in self.vehicles + self.attackers:
+                #         if vehicle.id != sender.id and vehicle.should_receive_packet(sender.position):
+                #             expected_receiver_ids.append(vehicle.id)
 
-                # 更新消息状态
-                for sender, packet, resource in normal_users:
-                    # 为每个预期的接收者初始化状态
-                    expected_receiver_ids = []
-                    for vehicle in self.vehicles + self.attackers:
-                        if vehicle.id != sender.id and vehicle.should_receive_packet(sender.position):
-                            expected_receiver_ids.append(vehicle.id)
+                #     for receiver_id in expected_receiver_ids:
+                #         msg_key = (sender.id, packet.packet_id, receiver_id)
+                #         if msg_key not in receiver_message_status:
+                #             receiver_message_status[msg_key] = {
+                #                 'success': True, 'resources_used': 0, 'failed_resources': set()
+                #             }
+                #         receiver_message_status[msg_key]['resources_used'] += 1
+                #         if not self.use_sinr and (has_attacker or collision_occurred):
+                #             receiver_message_status[msg_key]['failed_resources'].add(receiver_id)
 
-                    for receiver_id in expected_receiver_ids:
-                        msg_key = (sender.id, packet.packet_id, receiver_id)
-                        if msg_key not in receiver_message_status:
-                            receiver_message_status[msg_key] = {
-                                'success': False, 'resources_used': 0, 'failed_resources': set()
-                            }
-                        receiver_message_status[msg_key]['resources_used'] += 1
-                        if not self.use_sinr and (has_attacker or collision_occurred):
-                            receiver_message_status[msg_key]['failed_resources'].add(receiver_id)
-
-                # 更新资源块级失效原因统计
                 if not self.use_sinr:
                     if has_attacker: self.resource_block_attacks += 1
                     elif collision_occurred: self.resource_block_collisions += 1
-                if has_attacker and self.attackers and self.attackers[0].attack_success_this_step:
-                    self.total_attack_success += 1
-                    self.attackers[0].attack_success_count += 1
+                if has_attacker and self.attackers:
+                    for attacker in self.attackers:
+                        if attacker.attack_success_this_step:
+                            self.total_attack_success += 1
+                            attacker.attack_success_count += 1
             self.sinr_records.extend(slot_sinr_records)
-
+            # print("当前时隙:")
             finished_messages = set()
             for msg_key, status in receiver_message_status.items():
+                
                 sender_id, packet_id, receiver_id = msg_key
                 if sender_id >= self.num_vehicles or receiver_id >= self.num_vehicles:
                     continue
-                if status['resources_used'] == 2:  # 两个资源块都传输完毕
+                if status['resources_used'] == 2:
+                    # print("传输完成")
                     if status['failed_resources']: status['success'] = False
-
+                    # print(msg_key, status)
                     sender = next((v for v in self.vehicles if v.id == sender_id), None)
                     if sender:
                         sender.expected_receptions += 1
@@ -1834,7 +2183,9 @@ class V2XRLEnvironment(gym.Env):
             for msg_key in finished_messages:
                 if msg_key in receiver_message_status:
                     del receiver_message_status[msg_key]
-        return collision_info
+        
+        # MODIFICATION: Return the new status dictionary along with original info
+        return collision_info, rl_vehicle_transmission_status
 
     def _calculate_current_prr(self):
         """计算当前分组接收率(PRR)"""
@@ -1846,27 +2197,11 @@ class V2XRLEnvironment(gym.Env):
         """获取所有车辆的个人PRR"""
         vehicle_prrs = {}
         for vehicle in self.vehicles:
-            vehicle_prrs[vehicle.id] = vehicle.calculate_prr()
+            if hasattr(vehicle, 'calculate_prr'):
+                vehicle_prrs[vehicle.id] = vehicle.calculate_prr()
         return vehicle_prrs
 
-    def get_episode_stats(self):
-        """获取当前轮的统计信息"""
-        vehicle_prrs = self.get_vehicle_prrs()
-
-        return {
-            'total_collisions': self.collision_count,
-            'total_transmissions': self.transmission_count,
-            'prr': self._calculate_current_prr(),
-            'attack_success_rate': self.total_attack_success / max(1, self.attack_transmission_count),
-            'collision_rate': self.collision_count / max(1, self.resource_transmission_count),
-            'message_failures': self.message_failures,
-            'resource_block_attacks': self.resource_block_attacks,
-            'resource_block_collisions': self.resource_block_collisions,
-            'vehicle_prrs': vehicle_prrs,
-            'attack_transmission_count':self.attack_transmission_count,
-            'attack_count':self.attack_transmission_count,
-            'step_count': self.step_count
-        }
+    
 
     def reset_stats(self):
         """重置所有统计"""
@@ -1892,19 +2227,36 @@ class V2XRLEnvironment(gym.Env):
             pos_x = random.uniform(0, highway_length)
             position = np.array([pos_x, lane_y])
             velocity = np.array([10.0 if lane_y == lane1_y else -10.0, 0.0])
-            vehicle = Vehicle(i, position.copy(), velocity.copy(), self, self.vehicle_resource_mode)
+            
+            # MODIFICATION: Instantiate RLVehicle or Vehicle based on the flag
+            if self.use_rl_vehicles:
+                vehicle = RLVehicle(i, position.copy(), velocity.copy(), self)
+            else:
+                vehicle = Vehicle(i, position.copy(), velocity.copy(), self, self.vehicle_resource_mode)
+            
             self.vehicles.append(vehicle)
             vehicle_states.append((position.copy(), velocity.copy()))
         self.initial_vehicle_states = vehicle_states
 
     def _initialize_attackers(self):
-        """初始化攻击者并保存初始状态"""
+        """初始化攻击者并保存初始状态，根据攻击者数量均匀分配其初始位置。"""
+        # ADDITION: Do not initialize attackers if we are using RLVehicles
+        # if self.use_rl_vehicles:
+        #     self.attackers = []
+        #     self.initial_attacker_states = []
+        #     return
+
         highway_length = 1000.0
         self.attackers = []
         attacker_states = []
-        for i in range(self.num_attackers):
+        
+        num_attackers = self.num_attackers
+        for i in range(num_attackers):
             attacker_id = self.num_vehicles + i
-            position = np.array([highway_length/2, 7.5]) # Place attacker between lanes
+            
+            pos_x = (i + 1) * highway_length / (num_attackers + 1)
+            
+            position = np.array([pos_x, 0.0]) 
             velocity = np.array([0.0, 0.0])
 
             if self.attacker_type == 'RL':
@@ -1922,6 +2274,7 @@ class V2XRLEnvironment(gym.Env):
                 )
             self.attackers.append(attacker)
             attacker_states.append((position.copy(), velocity.copy()))
+            
         self.initial_attacker_states = attacker_states
 
     def close(self):

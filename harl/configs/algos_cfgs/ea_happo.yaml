@@ -29,6 +29,7 @@ train:
   # whether to consider the case of truncation when an episode is done
   use_proper_time_limits: True
   # if set, load models from this directory; otherwise, randomly initialise the models
+
   model_dir: ~
 eval:
   # whether to use evaluation
@@ -118,16 +119,26 @@ algo:
   fixed_order: False
 
   # --- EA-HAPPO specific parameters ---
-  use_ea: True                # Whether to use EA to optimize HAPPO
-  pop_size: 10                # Population size for EA
-  elite_fraction: 0.2         # Fraction of elites to preserve
-  crossover_prob: 0.5         # Crossover probability
-  mutation_prob: 0.9          # Mutation probability
-  prob_reset_and_sup: 0.05    # Probability of super mutation and reset
-  frac: 0.1                   # Fraction of weights to mutate in a layer
-  EA_alpha: 0.5               # Weight of EA loss term
-  Org_alpha: 0.5              # Weight of original HAPPO loss term
-  state_alpha: 0.1            # Weight of state prediction loss (if used)
+  # use_ea: True                # Whether to use EA to optimize HAPPO
+  # pop_size: 10                # Population size for EA
+  # elite_fraction: 0.2         # Fraction of elites to preserve
+  # crossover_prob: 0.5         # Crossover probability
+  # mutation_prob: 0.9          # Mutation probability
+  # prob_reset_and_sup: 0.05    # Probability of super mutation and reset
+  # frac: 0.1                   # Fraction of weights to mutate in a layer
+  # EA_alpha: 0.5               # Weight of EA loss term
+  # Org_alpha: 0.5              # Weight of original HAPPO loss term
+  # state_alpha: 0.1            # Weight of state prediction loss (if used)
+  use_ea: True             # 是否启用EA
+  pop_size: 10             # 种群大小
+  ea_freq: 10              # EA执行频率 (每N次PPO更新执行一次EA)
+
+  # SSNE需要的参数
+  frac: 0.02               # 变异强度/比例 (原mutation_power)
+  elite_fraction: 0.1      # 精英比例
+  prob_reset_and_sup: 0.05 # 超级变异/重置的概率
+  mutation_prob: 0.9       # 个体发生变异的概率
+  
 
 logger:
   # logging directory

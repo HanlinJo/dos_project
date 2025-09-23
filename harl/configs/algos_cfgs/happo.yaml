@@ -13,11 +13,11 @@ device:
   torch_threads: 4
 train:
   # number of parallel environments for training data collection
-  n_rollout_threads: 10
+  n_rollout_threads: 1
   # number of total training steps
-  num_env_steps: 20000000
+  num_env_steps: 1000000
   # number of steps per environment per training data collection
-  episode_length: 1000
+  episode_length: 200
   # logging interval
   log_interval: 5
   # evaluation interval
@@ -31,7 +31,7 @@ train:
   # if set, load models from this directory; otherwise, randomly initialise the models
   model_dir: ~
 
-  use_ea: True              # 是否启用EA辅助训练的总开关
+  use_ea: False              # 是否启用EA辅助训练的总开关
   # pop_size: 10              # 种群大小 (不包括主Actor)
   # state_alpha: 0.01         # MINE 损失的权重系数
   # EA_alpha: 0.1             # EA 指导损失的权重系数

@@ -118,6 +118,40 @@ class OnPolicyActorBuffer:
         if self.available_actions is not None:
             self.available_actions[0] = self.available_actions[-1].copy()
 
+    def sample(self, advantages):
+        """
+        Sample the entire buffer's data as a single batch.
+        Args:
+            advantages: (np.ndarray) advantages calculated from the critic.
+        Returns:
+            A tuple containing the entire buffer's data as a single batch.
+        """
+        # Combine the first two dimensions (episode_length and n_rollout_threads) to form a batch.
+        obs_batch = self.obs[:-1].reshape(-1, *self.obs.shape[2:])
+        rnn_states_batch = self.rnn_states[:-1].reshape(-1, *self.rnn_states.shape[2:])
+        actions_batch = self.actions.reshape(-1, self.actions.shape[-1])
+        masks_batch = self.masks[:-1].reshape(-1, 1)
+        active_masks_batch = self.active_masks[:-1].reshape(-1, 1)
+        old_action_log_probs_batch = self.action_log_probs.reshape(-1, self.action_log_probs.shape[-1])
+        adv_targ = advantages.reshape(-1, 1)
+        
+        if self.available_actions is not None:
+            available_actions_batch = self.available_actions[:-1].reshape(-1, self.available_actions.shape[-1])
+        else:
+            available_actions_batch = None
+
+        if self.factor is not None:
+            factor_batch = self.factor.reshape(-1, self.factor.shape[-1])
+            return (obs_batch, rnn_states_batch, actions_batch, masks_batch, active_masks_batch,
+                    old_action_log_probs_batch, adv_targ, available_actions_batch, factor_batch)
+        else:
+            # The last element (factor_batch) is optional, handle its absence gracefully.
+            # We'll return a tuple that can be unpacked by the update function, which might need adjustment
+            # if factor is None. A simple fix is to return None for the factor.
+            factor_batch = None
+            return (obs_batch, rnn_states_batch, actions_batch, masks_batch, active_masks_batch,
+                    old_action_log_probs_batch, adv_targ, available_actions_batch, factor_batch)
+            
     def feed_forward_generator_actor(
         self, advantages, actor_num_mini_batch=None, mini_batch_size=None
     ):
