@@ -2205,7 +2205,7 @@ class ResourceInfo:
 class SINRCalculator:
     """SINR Calculator - Encapsulates SINR calculation logic"""
 
-    def __init__(self, tx_power=23.0, noise_power=-95.0, use_simple_interference=False,attacker_interference_boost=10.0,normal_interference_boost=8.0):
+    def __init__(self, tx_power=23.0, noise_power=-95.0, use_simple_interference=False,attacker_interference_boost=5.0,normal_interference_boost=4.0):
         self.tx_power = tx_power  # Transmit power (dBm)
         self.noise_power = noise_power  # Noise power (dBm)
         self.use_simple_interference = use_simple_interference  # Whether to use simplified interference calculation
@@ -2686,14 +2686,14 @@ class RLVehicle:
         self.total_resources = self.num_slots * self.num_subchannels  # Total number of resource blocks
         
         self.next_transmission_time = 0
-        self.transmission_cycle = 100
+        self.transmission_cycle = self.num_slots
         self.current_resources = None
         self.normal_packets_sent = 0
         self.normal_success_count = 0
         self.collisions_caused = 0
         self.target_slot = -1
         self.sensing_data = []
-        self.sensing_window_duration = 100
+        self.sensing_window_duration = self.num_slots
         self.last_action = None
         self.last_reward = 0
         self.resources_changed = False
@@ -2789,6 +2789,12 @@ class RLVehicle:
             self.velocity = -self.velocity
             self.position[1] = 5.0
 
+    def calculate_prr(self):
+        """Calculate personal PRR"""
+        if self.total_expected_receptions > 0:
+            return self.total_successful_receptions/self.total_expected_receptions
+        return 0.0
+    
     def _action_to_tuple(self, a):
         if isinstance(a, np.ndarray):
             if a.ndim == 0:
@@ -2909,7 +2915,7 @@ class RLVehicle:
         if was_successful:
             return 2.0 + success_rate_reward  # Reward for successful transmission
         else:
-            return -5.0 + success_rate_reward # Penalty for collision
+            return -8.0 + success_rate_reward # Penalty for collision
         
     def add_sensing_data(self, slot_id, subchannel, pRsvp, sender_id, timestamp, sender_position,expected_receivers):
         """Add sensing data from received transmissions"""
@@ -2971,14 +2977,14 @@ class RLAttacker:
         self.total_resources = self.num_slots * self.num_subchannels  # Total number of resource blocks
         self.last_attack_success_rate = 0.0  # Last attack success rate
         self.next_transmission_time = 0
-        self.transmission_cycle = 100
+        self.transmission_cycle = self.num_slots
         self.current_resources = None
         self.attack_packets_sent = 0
         self.attack_success_count = 0
         self.collisions_caused = 0
         self.target_slot = -1
         self.sensing_data = []
-        self.sensing_window_duration = 100
+        self.sensing_window_duration = self.num_slots
         self.last_action = None
         self.last_reward = 0
         self.resources_changed = False
@@ -3234,7 +3240,7 @@ class FixAttacker(Vehicle):
         self.has_transmitted = False
         self.attack_success_this_step = False
         self.num_slots = sim.resource_pool.num_slots
-        self.sensing_window_duration = 200
+        self.sensing_window_duration = self.num_slots
         self.prob_resource_keep = 0.2
         self.communication_range = 320
         self.cycle_groups = self._calculate_cycle_groups() if not TARGETED_ATTACK_MODE else []
@@ -3586,6 +3592,7 @@ class V2XRLEnvironment(gym.Env):
         if (self.attacker_type != 'RL' and not self.use_rl_vehicles):
             final_obs_dim = 1
             total_actions = 1
+            self.step_duration = self.num_slots
 
         self.action_space = [spaces.Discrete(total_actions) for _ in range(self.n_agents)]
         self.observation_space = [
@@ -3793,7 +3800,7 @@ class V2XRLEnvironment(gym.Env):
             self.last_global_prr = current_prr
             
             successful_tx = sum(1 for success in step_outcomes['rl_vehicle_status'].values() if success)
-            team_reward = 2 * (successful_tx - 15) 
+            team_reward = 2 * (successful_tx - 16) 
 
             for vehicle in self.vehicles:
                 if isinstance(vehicle, RLVehicle):
@@ -3849,22 +3856,88 @@ class V2XRLEnvironment(gym.Env):
         done = self.current_time >= self.episode_duration
         dones = [done for _ in range(self.n_agents)]
         
-        # <<< MODIFICATION START: Format the info dictionary as requested >>>
-        info = {
-            'collisions_caused_this_step': total_collision_caused_due_to_attack,
-            'total_collisions': self.collision_count,
-            'attack_success_rate': self.total_attack_success / max(1, self.attack_transmission_count),
-            'prr': self._calculate_current_prr(),
-            'message_failures': self.message_failures,
-            'collision_rate': self.collision_count / max(1, self.transmission_count)
-        }
-        # <<< MODIFICATION END >>>
-        infos = [info for _ in range(self.n_agents)]
+        # # <<< MODIFICATION START: Format the info dictionary as requested >>>
+        # info = {
+        #     'collisions_caused_this_step': total_collision_caused_due_to_attack,
+        #     'total_collisions': self.collision_count,
+        #     'attack_success_rate': self.total_attack_success / max(1, self.attack_transmission_count),
+        #     'prr': self._calculate_current_prr(),
+        #     'message_failures': self.message_failures,
+        #     'collision_rate': self.collision_count / max(1, self.transmission_count)
+        # }
+        # # <<< MODIFICATION END >>>
+        # infos = [info for _ in range(self.n_agents)]
+        infos = {}
 
+        # 1. 添加当前时间
+        infos['current_time'] = self.current_time
+
+        # 2. 初始化用于存储每个步骤详细信息的列表
+        infos['resource_usage'] = []
+        infos['transmission_outcomes'] = []
+        infos['vehicle_prr'] = {}
+        
+        for resource, occupants in resource_usage_map.items():
+            # 1. 为当前 resource 初始化一个空的占用者列表
+            occupants_list = []
+            
+            # 2. 遍历这个 resource 上的所有占用者
+            for occupant in occupants:
+                occupant_type = 'Unknown'
+                # 判断使用者类型
+                if isinstance(occupant[0], RLVehicle):
+                    occupant_type = 'RL_Vehicle'
+                elif isinstance(occupant[0], (RLAttacker, FixAttacker)):
+                    occupant_type = 'Attacker'
+                elif isinstance(occupant[0], Vehicle):
+                    occupant_type = 'Normal_Vehicle'
+                
+                
+                # 3. 将每个占用者的信息作为一个字典添加到列表中
+                occupants_list.append({
+                    'id': occupant[0].id,
+                    'type': occupant_type
+                })
+            
+            # 4. 在处理完所有占用者后，将 resource 的完整信息一次性添加到最终结果中
+            infos['resource_usage'].append({
+                'resource_id': (resource.slot_id, resource.subchannel),
+                'occupants': occupants_list
+            })
+        # # # 记录RL车辆的发送状态
+        if 'rl_vehicle_status' in step_outcomes:
+            infos['transmission_outcomes'].append(step_outcomes['rl_vehicle_status'])
+        
+        # 记录攻击者的干扰影响
+        if 'attacker_impact' in step_outcomes:
+            # 创建一个 attacker_impact 的可序列化副本
+            serializable_impact = {}
+            for attacker_id, impacted_vehicle_set in step_outcomes['attacker_impact'].items():
+                # 将每个 set 转换为 list
+                serializable_impact[attacker_id] = list(impacted_vehicle_set)
+
+            # 将可序列化的版本添加到 infos 中
+            infos['transmission_outcomes'].append(serializable_impact)
+        # infos['transmission_outcomes'].append(step_outcomes)
+            
+        # 5. 记录各个车辆的PRR
+        for vehicle in self.vehicles:
+            infos['vehicle_prr'][vehicle.id] = vehicle.calculate_prr()
+        
+        infos['total_collisions'] = self.collision_count
+        infos['message_failures'] = self.message_failures
+        infos['prr'] = self._calculate_current_prr()
+        infos['attack_success_rate'] = self.total_attack_success / max(1, self.attack_transmission_count)
+        infos['collisions_caused_this_step'] = step_outcomes['collisions_caused_this_step']
+        infos['collision_rate'] = self.collision_count / max(1, self.transmission_count)
+        # print(infos)
+        # 6. 为每个 agent 创建一个 info 字典
+        final_infos = [infos for _ in range(self.num_vehicles)]
+        
         total_actions = self.action_space[0].n
         avail_actions = [np.ones(total_actions, dtype=np.float32) for _ in range(self.n_agents)]
 
-        return next_obs, next_state, rewards, dones, infos, avail_actions
+        return next_obs, next_state, rewards, dones, final_infos, avail_actions
 
     
     def _resolve_step_transmissions(self, resource_usage_map):
@@ -3875,7 +3948,8 @@ class V2XRLEnvironment(gym.Env):
         """
         outcomes = {
             'attacker_impact': defaultdict(set),
-            'rl_vehicle_status': {v.id: True for v in self.vehicles if isinstance(v, RLVehicle)}
+            'rl_vehicle_status': {},
+            'collisions_caused_this_step' : 0
         }
         
         # MODIFICATION: Use a dictionary to track the success of each block for each message-receiver pair.
@@ -3891,7 +3965,7 @@ class V2XRLEnvironment(gym.Env):
             # ADDED: Print resource block and which vehicles are using it
             # print(f"\nResource Block: {str(resource)}")
             # print(f"  Users (Senders): {sender_ids}")
-            
+            outcomes['rl_vehicle_status'].update({v.id: True for v in senders if isinstance(v, (RLVehicle,Vehicle))})
             normal_vehicles = [s for s in senders if not isinstance(s, (RLAttacker, FixAttacker))]
             attackers = [s for s in senders if isinstance(s, (RLAttacker, FixAttacker))]
             
@@ -3904,7 +3978,7 @@ class V2XRLEnvironment(gym.Env):
             # --- Update outcomes for reward calculation ---
             if len(senders) > 1:
                 for sender in senders:
-                    if isinstance(sender, RLVehicle):
+                    if isinstance(sender, (RLVehicle, Vehicle)):
                         outcomes['rl_vehicle_status'][sender.id] = False
                     if isinstance(sender,Vehicle):
                         sender.current_resources_collision = True
@@ -3968,6 +4042,7 @@ class V2XRLEnvironment(gym.Env):
                             if not success:
                                 self.collision_count += 1
                                 sender.collisions+=1
+                                outcomes['collisions_caused_this_step'] += 1
                             # else:
                                 # sender.total_successful_receptions +=1 
                 for receiver in self.attackers:
@@ -3994,11 +4069,11 @@ class V2XRLEnvironment(gym.Env):
             sender = self.vehicles[sender_id] # Assuming vehicle IDs are 0 to num_vehicles-1
 
             # Increment expected packets only once per transmitted message
-            if (sender_id, packet_id) not in processed_expected_packets:
+            # if (sender_id, packet_id) not in processed_expected_packets:
                 # A message is expected to be received by all vehicles in range.
                 # Here we are processing on a per-receiver basis, which is correct for PRR.
-                sender.expected_receptions += 1
-                self.total_expected_packets += 1
+                # sender.expected_receptions += 1
+                
                 # Mark this sender's packet as processed for expected counts to avoid recounting
                 # Note: This logic assumes one receiver is processed at a time. A better way is to count all receivers in range once.
                 # However, this per-receiver counting is standard for PRR calculation.
@@ -4010,6 +4085,7 @@ class V2XRLEnvironment(gym.Env):
 
             if is_complete:
                 sender.total_expected_receptions+=1
+                self.total_expected_packets += 1
                 if is_successful:
                     sender.total_successful_receptions += 1
                     self.total_received_packets += 1
@@ -4035,7 +4111,7 @@ class V2XRLEnvironment(gym.Env):
         
         # Update the global counter for the info dict
         # self.total_attack_success += total_vehicles_impacted_by_attack
-        outcomes['collisions_caused_this_step'] = total_vehicles_impacted_by_attack
+        # outcomes['collisions_caused_this_step'] = total_vehicles_impacted_by_attack
         # Now, calculate total message failures based on the difference
         # between expected receptions and successful receptions.
         # self.message_failures = self.total_expected_packets - self.total_received_packets
@@ -4099,7 +4175,7 @@ class V2XRLEnvironment(gym.Env):
             lane_y = lane1_y if i % 2 == 0 else lane2_y
             pos_x = random.uniform(0, highway_length)
             position = np.array([pos_x, lane_y])
-            velocity = np.array([10.0 if lane_y == lane1_y else -10.0, 0.0])
+            velocity = np.array([33.0 if lane_y == lane1_y else -33.0, 0.0])
             if self.use_rl_vehicles:
                 vehicle = RLVehicle(i, position.copy(), velocity.copy(), self, self.action_num)
             else:
