@@ -2,7 +2,7 @@
 import argparse
 import json
 from harl.utils.configs_tools import get_defaults_yaml_args, update_args
-
+import multiprocessing 
 
 def main():
     """Main function."""
@@ -94,4 +94,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method('spawn', force=True) 
     main()

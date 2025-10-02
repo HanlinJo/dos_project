@@ -47,6 +47,13 @@ num_attackers: 1
 vehicle_resource_mode: 'Combine'
 attacker_type: 'Fix' # Use a rule-based attacker as the adversary
 use_rl_vehicles: True # This flag makes all 'num_vehicles' RL agents
+# load_vehicle_model: False # Whether to load pre-trained models for vehicles
+# load_attacker_model: False # Whether to load pre-trained models for attackers
+use_pretrained_rl_vehicles: True
+rl_vehicle_model_path: "/home/xhl/mywork/harl/examples/results/v2v/my_v2v_env/happo/newTest/newTestRLVehcile/TEST_20RLVEHICLE_1FIX/seed-00042-2025-09-30-16-36-33/models"
+
+rl_vehicle_config_path: "/home/xhl/mywork/harl/examples/results/v2v/my_v2v_env/happo/newTest/newTestRLVehcile/TEST_20RLVEHICLE_1FIX/seed-00042-2025-09-30-16-36-33/config.json"
+  
 # Parameters for the 'Fix' attacker, with explicit policy settings
 fix_attacker_params:
   cycle: 20
