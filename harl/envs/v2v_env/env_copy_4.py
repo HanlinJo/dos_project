@@ -1446,6 +1446,7 @@ class V2XRLEnvironment(gym.Env):
         self.print_detail = False
         self.use_rl_vehicles = kwargs.get('use_rl_vehicles', False)
         self.attacker_target_ids = [1] if self.num_attackers == 1 else [-1,-1]
+        self.use_adversarial_attacker = kwargs.get('use_adversarial_attacker', False)
         self.use_pretrained_rl_vehicles = kwargs.get('use_pretrained_rl_vehicles', False)
         self.rl_vehicle_model_path = kwargs.get('rl_vehicle_model_path', None)
         rl_vehicle_config_path = kwargs.get('rl_vehicle_config_path', None)
@@ -1776,7 +1777,7 @@ class V2XRLEnvironment(gym.Env):
         # print("-" * (60 + len(str(self.step_count)) + len(str(self.current_time))))
         left = int((self.current_time % self.num_slots)/self.step_duration)*self.step_duration
         right = left + self.step_duration
-        
+        temp_slot_pool = defaultdict(list)
         for agent in all_agents:
             if agent.current_resources and agent.current_resources[0].slot_id >= left and agent.current_resources[0].slot_id < right:
                 # Create a single packet for this agent for the whole step
@@ -1788,6 +1789,8 @@ class V2XRLEnvironment(gym.Env):
                 for resource in agent.current_resources:
                      # Only consider resources within the current step's time window for resolution
                     resource_usage_map[resource].append((agent, packet))
+                    if agent.id not in temp_slot_pool[resource.slot_id]:
+                         temp_slot_pool[resource.slot_id].append(agent.id)
             agent.transmission_count+=1
         # Resolve all outcomes for this step
         step_outcomes = self._resolve_step_transmissions(resource_usage_map)
@@ -1803,6 +1806,7 @@ class V2XRLEnvironment(gym.Env):
         rewards = []
         #TODO 修改了RLVehicle奖励
         if self.use_rl_vehicles:
+            team_reward = 0.0
             current_prr = self._calculate_current_prr()
             prr_reward = (current_prr - self.last_global_prr) * 10.0
             prr_reward = np.clip(prr_reward, -0.5, 0.5)
@@ -1826,28 +1830,38 @@ class V2XRLEnvironment(gym.Env):
                 else:
                     rewards.append([0.0])
         elif self.attacker_type == 'RL':
-            team_reward = 0
-            if self.n_agents > 1 and self.multi_agent_coordination:
-                resource_list = [res for res_list in attacker_action_resources.values() for res in res_list]
-                num_overlaps = len(resource_list) - len(set(resource_list))
-                if num_overlaps > 0:
-                    team_reward -= 1.0
-            #     # resource_list = [res for res_list in attacker_action_resources.values() for res in res_list]
-            #     # num_overlaps = len(resource_list) - len(set(resource_list))
-            #     # team_reward -= num_overlaps * 3.0
-            if total_collision_caused_due_to_attack >= 2:
-                team_reward += 1.0
-            # print(team_reward,total_collision_caused_due_to_attack)
+            if not self.use_adversarial_attacker:
+                team_reward = 0
+                if self.n_agents > 1 and self.multi_agent_coordination:
+                    resource_list = [res for res_list in attacker_action_resources.values() for res in res_list]
+                    num_overlaps = len(resource_list) - len(set(resource_list))
+                    if num_overlaps > 0:
+                        team_reward -= 1.0
+                #     # resource_list = [res for res_list in attacker_action_resources.values() for res in res_list]
+                #     # num_overlaps = len(resource_list) - len(set(resource_list))
+                #     # team_reward -= num_overlaps * 3.0
+                if total_collision_caused_due_to_attack >= 2:
+                    team_reward += 1.0
+                # print(team_reward,total_collision_caused_due_to_attack)
 
-            for attacker in self.attackers:
-                if isinstance(attacker, RLAttacker):
-                    affected_vehicles = step_outcomes['attacker_impact'].get(attacker.id, set())
-                    collision_count = len(affected_vehicles)
-                    attacker.attack_success_count += 1 if collision_count > 0 else 0
-                    attacker.attack_packets_sent += len(attacker.current_resources)
-                    
-                    individual_reward = attacker.calculate_reward(collision_count, affected_vehicles)
-                    rewards.append([0.6*individual_reward + 0.4*team_reward])
+                for attacker in self.attackers:
+                    if isinstance(attacker, RLAttacker):
+                        affected_vehicles = step_outcomes['attacker_impact'].get(attacker.id, set())
+                        collision_count = len(affected_vehicles)
+                        attacker.attack_success_count += 1 if collision_count > 0 else 0
+                        attacker.attack_packets_sent += len(attacker.current_resources)
+
+                        individual_reward = attacker.calculate_reward(collision_count, affected_vehicles)
+                        rewards.append([0.6*individual_reward + 0.4*team_reward])
+            else:
+                collisions_caused_this_step = step_outcomes['collisions_caused_this_step']
+                for attacker in self.attackers:
+                    if isinstance(attacker, RLAttacker):
+                        if collisions_caused_this_step > 0:
+                            reward = (collisions_caused_this_step/2)/(len(self.vehicles)/2)
+                            rewards.append([reward])
+                        else:
+                            rewards.append([-0.2])
         else:
             rewards = [[0.0] for _ in range(self.n_agents)]
 
@@ -1888,7 +1902,8 @@ class V2XRLEnvironment(gym.Env):
 
         # 1. 添加当前时间
         infos['current_time'] = self.current_time
-
+        infos['slot_usage_this_step'] = temp_slot_pool
+        # print("Step:",self.current_time,"ms, Slot usage:",temp_slot_pool)
         # 2. 初始化用于存储每个步骤详细信息的列表
         # infos['resource_usage'] = []
         # infos['transmission_outcomes'] = []
@@ -1994,6 +2009,7 @@ class V2XRLEnvironment(gym.Env):
             #         print(f"  'sender': {attacker.id}")
             # --- Update outcomes for reward calculation ---
             if len(senders) > 1:
+                outcomes['collisions_caused_this_step'] += len(normal_vehicles)
                 for sender in senders:
                     if isinstance(sender, (RLVehicle, Vehicle)):
                         outcomes['rl_vehicle_status'][sender.id] = False
@@ -2058,8 +2074,8 @@ class V2XRLEnvironment(gym.Env):
                             # sender.total_expected_receptions+=1
                             if not success:
                                 self.collision_count += 1
-                                sender.collisions+=1
-                                outcomes['collisions_caused_this_step'] += 1
+                                sender.collisions += 1
+                                
                             # else:
                                 # sender.total_successful_receptions +=1 
                 for receiver in self.attackers:

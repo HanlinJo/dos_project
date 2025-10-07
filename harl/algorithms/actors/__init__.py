@@ -10,6 +10,7 @@ from harl.algorithms.actors.maddpg import MADDPG
 from harl.algorithms.actors.matd3 import MATD3
 from harl.algorithms.actors.mappo import MAPPO
 from harl.algorithms.actors.ea_happo import EAHAPPO # <--- 添加这一行
+from harl.algorithms.actors.happo_adversarial import HAPPOAdversarial
 
 ALGO_REGISTRY = {
     "happo": HAPPO,
@@ -23,4 +24,5 @@ ALGO_REGISTRY = {
     "matd3": MATD3,
     "mappo": MAPPO,
     "ea_happo": EAHAPPO,  # <--- 添加这一行来注册您的新算法
+    "happo_adversarial": HAPPOAdversarial,  # <--- 添加这一行来注册您的新算法
 }

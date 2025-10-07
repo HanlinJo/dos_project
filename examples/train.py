@@ -25,6 +25,7 @@ def main():
             "matd3",
             "mappo",
             "ea_happo",
+            "happo_adversarial",
         ],
         help="Algorithm name. Choose from: happo, hatrpo, haa2c, haddpg, hatd3, hasac, had3qn, maddpg, matd3, mappo.",
     )

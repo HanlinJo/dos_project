@@ -116,7 +116,7 @@ class OnPolicyBaseRunner:
             self.actor = []
             for agent_id in range(self.num_agents):
                 agent = ALGO_REGISTRY[args["algo"]](
-                    {**algo_args["model"], **algo_args["algo"]},
+                    {**algo_args["model"], **algo_args["algo"], **self.env_args},
                     self.envs.observation_space[agent_id],
                     self.envs.action_space[agent_id],
                     device=self.device,
@@ -501,9 +501,9 @@ class OnPolicyBaseRunner:
         """Evaluate the model."""
         self.logger.eval_init()  # logger callback at the beginning of evaluation
         
-        all_infos = []
+        current_episode_slot_usage = []
         eval_episode = 0
-
+        has_saved_log_for_this_eval = False
         eval_obs, eval_share_obs, eval_available_actions = self.eval_envs.reset()
 
         eval_rnn_states = np.zeros(
@@ -556,9 +556,20 @@ class OnPolicyBaseRunner:
             self.logger.eval_per_step(
                 eval_data
             )  # logger callback at each step of evaluation
-
+            if not has_saved_log_for_this_eval:
+                info_dict = eval_infos[0][0] 
+                # print(eval_infos)
+                # print("-------")
+                # print(eval_infos[0])
+                # exit(0)
+                # We only care about the first parallel environment's info ([0]).
+                if 'slot_usage_this_step' in info_dict:
+                    # 确保我们追加的是 JSON 友好的普通字典，而不是 defaultdict
+                    slot_usage_data = dict(info_dict['slot_usage_this_step'])
+                    current_episode_slot_usage.append(slot_usage_data)
+                    # print(current_episode_slot_usage)
             eval_dones_env = np.all(eval_dones, axis=1)
-
+            
             eval_rnn_states[
                 eval_dones_env == True
             ] = np.zeros(  # if env is done, then reset rnn_state to all zero
@@ -578,10 +589,44 @@ class OnPolicyBaseRunner:
             eval_masks[eval_dones_env == True] = np.zeros(
                 ((eval_dones_env == True).sum(), self.num_agents, 1), dtype=np.float32
             )
-            all_infos.append(eval_infos[0])
+            # all_infos.append(eval_infos[0])
             for eval_i in range(self.algo_args["eval"]["n_eval_rollout_threads"]):
                 if eval_dones_env[eval_i]:
                     eval_episode += 1
+                    # --- MODIFICATION START: Precise Saving Logic ---
+                    # Check three conditions:
+                    # 1. Is this the first parallel environment (thread 0)?
+                    # 2. Have we NOT already saved a log during this eval run?
+                    if eval_i == 0 and not has_saved_log_for_this_eval:
+                        import json
+                        import os
+                        import glob
+                        import datetime # 导入datetime模块用于生成时间戳
+
+                        # Define the directory to save detailed logs
+                        base_exp_dir = os.path.dirname(self.save_dir)
+                        slot_usage_dir = os.path.join(base_exp_dir, 'infos', 'slot_usage_details')
+                        os.makedirs(slot_usage_dir, exist_ok=True)
+                        timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+                        # Create a unique filename based on the total training steps
+                        file_name = f'eval_episode_{eval_episode}_at_{timestamp}.json'
+                        file_path = os.path.join(slot_usage_dir, file_name)
+
+                        # Save the collected slot usage data for this episode
+                        try:
+                            with open(file_path, 'w') as f:
+                                json.dump(current_episode_slot_usage, f, indent=4)
+                            print(f"Slot usage log for the first episode saved to {file_path}")
+                        except Exception as e:
+                            print(f"Error saving slot usage log: {e}")
+                        
+                        # Set the flag to True to prevent any further saving in this eval run
+                        has_saved_log_for_this_eval = True
+
+                    # Clear the temporary list to prepare for the next episode in this thread
+                    if eval_i == 0:
+                        current_episode_slot_usage.clear()
+                    # --- MODIFICATION END ---
                     self.logger.eval_thread_done(
                         eval_i
                     )  # logger callback when an episode is done
@@ -592,20 +637,131 @@ class OnPolicyBaseRunner:
                 )  # logger callback at the end of evaluation
                 break
             
-        import json
-        import os
-        # The path to save the model is examples/result/myenv/myenv_name/happo/models
-        # The json file should be stored in examples/result/myenv/myenv_name/happo
-        save_dir = os.path.dirname(self.save_dir)
-        # print(all_infos[0])
+        # import json
+        # import os
+        # # The path to save the model is examples/result/myenv/myenv_name/happo/models
+        # # The json file should be stored in examples/result/myenv/myenv_name/happo
+        # save_dir = os.path.dirname(self.save_dir)
+        # # print(all_infos[0])
         
-        # Convert numpy arrays to lists for JSON serialization
-        def convert_numpy(obj):
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            return obj
-        with open(os.path.join(save_dir, 'all_infos.json'), 'w') as f:
-            json.dump(all_infos, f, default=convert_numpy)
+        # # Convert numpy arrays to lists for JSON serialization
+        # def convert_numpy(obj):
+        #     if isinstance(obj, np.ndarray):
+        #         return obj.tolist()
+        #     return obj
+        # with open(os.path.join(save_dir, 'all_infos.json'), 'w') as f:
+        #     json.dump(all_infos, f, default=convert_numpy)
+        
+        
+    # def eval(self):
+    #     """Evaluate the model."""
+    #     self.logger.eval_init()  # logger callback at the beginning of evaluation
+        
+    #     all_infos = []
+    #     eval_episode = 0
+
+    #     eval_obs, eval_share_obs, eval_available_actions = self.eval_envs.reset()
+
+    #     eval_rnn_states = np.zeros(
+    #         (
+    #             self.algo_args["eval"]["n_eval_rollout_threads"],
+    #             self.num_agents,
+    #             self.recurrent_n,
+    #             self.rnn_hidden_size,
+    #         ),
+    #         dtype=np.float32,
+    #     )
+    #     eval_masks = np.ones(
+    #         (self.algo_args["eval"]["n_eval_rollout_threads"], self.num_agents, 1),
+    #         dtype=np.float32,
+    #     )
+
+    #     while True:
+    #         eval_actions_collector = []
+    #         for agent_id in range(self.num_agents):
+    #             eval_actions, temp_rnn_state = self.actor[agent_id].act(
+    #                 eval_obs[:, agent_id],
+    #                 eval_rnn_states[:, agent_id],
+    #                 eval_masks[:, agent_id],
+    #                 eval_available_actions[:, agent_id]
+    #                 if eval_available_actions[0] is not None
+    #                 else None,
+    #                 deterministic=True,
+    #             )
+    #             eval_rnn_states[:, agent_id] = _t2n(temp_rnn_state)
+    #             eval_actions_collector.append(_t2n(eval_actions))
+
+    #         eval_actions = np.array(eval_actions_collector).transpose(1, 0, 2)
+
+    #         (
+    #             eval_obs,
+    #             eval_share_obs,
+    #             eval_rewards,
+    #             eval_dones,
+    #             eval_infos,
+    #             eval_available_actions,
+    #         ) = self.eval_envs.step(eval_actions)
+    #         eval_data = (
+    #             eval_obs,
+    #             eval_share_obs,
+    #             eval_rewards,
+    #             eval_dones,
+    #             eval_infos,
+    #             eval_available_actions,
+    #         )
+    #         self.logger.eval_per_step(
+    #             eval_data
+    #         )  # logger callback at each step of evaluation
+
+    #         eval_dones_env = np.all(eval_dones, axis=1)
+
+    #         eval_rnn_states[
+    #             eval_dones_env == True
+    #         ] = np.zeros(  # if env is done, then reset rnn_state to all zero
+    #             (
+    #                 (eval_dones_env == True).sum(),
+    #                 self.num_agents,
+    #                 self.recurrent_n,
+    #                 self.rnn_hidden_size,
+    #             ),
+    #             dtype=np.float32,
+    #         )
+
+    #         eval_masks = np.ones(
+    #             (self.algo_args["eval"]["n_eval_rollout_threads"], self.num_agents, 1),
+    #             dtype=np.float32,
+    #         )
+    #         eval_masks[eval_dones_env == True] = np.zeros(
+    #             ((eval_dones_env == True).sum(), self.num_agents, 1), dtype=np.float32
+    #         )
+    #         all_infos.append(eval_infos[0])
+    #         for eval_i in range(self.algo_args["eval"]["n_eval_rollout_threads"]):
+    #             if eval_dones_env[eval_i]:
+    #                 eval_episode += 1
+    #                 self.logger.eval_thread_done(
+    #                     eval_i
+    #                 )  # logger callback when an episode is done
+
+    #         if eval_episode >= self.algo_args["eval"]["eval_episodes"]:
+    #             self.logger.eval_log(
+    #                 eval_episode
+    #             )  # logger callback at the end of evaluation
+    #             break
+            
+    #     import json
+    #     import os
+    #     # The path to save the model is examples/result/myenv/myenv_name/happo/models
+    #     # The json file should be stored in examples/result/myenv/myenv_name/happo
+    #     save_dir = os.path.dirname(self.save_dir)
+    #     # print(all_infos[0])
+        
+    #     # Convert numpy arrays to lists for JSON serialization
+    #     def convert_numpy(obj):
+    #         if isinstance(obj, np.ndarray):
+    #             return obj.tolist()
+    #         return obj
+    #     with open(os.path.join(save_dir, 'all_infos.json'), 'w') as f:
+    #         json.dump(all_infos, f, default=convert_numpy)
 
             
 

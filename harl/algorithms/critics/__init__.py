@@ -18,4 +18,5 @@ CRITIC_REGISTRY = {
     "had3qn": DiscreteQCritic,
     "maddpg": ContinuousQCritic,
     "matd3": TwinContinuousQCritic,
+    "happo_adversarial": VCritic,  # <--- 添加这一行来注册您的新算法
 }
