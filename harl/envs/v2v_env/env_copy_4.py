@@ -665,6 +665,41 @@ class RLVehicle:
             return tuple(a)
         return (a,)
 
+    def get_individual_resource_state_limit_state(self, current_time):
+        """
+        MODIFICATION: Simplifies the state representation to be slot-based.
+        A slot is marked as 1 if any transmission is sensed on any of its subchannels, 
+        0 otherwise. The state is an absolute representation of the entire slot pool.
+        """
+        self._update_sensing_window(current_time)
+        
+        # --- MODIFICATION START ---
+        # State array now only has one dimension for the slots.
+        resource_state = np.zeros(self.num_slots)
+        
+        # Iterate through all sensed data points
+        for data in self.sensing_data:
+            slot_id = data.slot_id % self.num_slots
+            
+            # As soon as we sense a transmission in any subchannel for a given slot,
+            # we mark the entire slot as occupied (1) and can move on.
+            # No need to check which subchannel it was.
+            #TODO
+            # --- MODIFICATION START: Incorporate distance ---
+            # Get the position of the sender from the sensing data
+            sender_position = data.sender_position
+            # Calculate the distance from the current agent to the sender
+            distance = np.linalg.norm(self.position - sender_position)
+            # Normalize the distance: 1 for very close, 0 for out of range
+            normalized_distance = max(0.01, 1 - min(1, distance / self.sim.communication_range))
+            # If this sender is closer than any previously sensed sender for this resource,
+            # update the state with the new, higher value.
+            if normalized_distance > resource_state[slot_id]:
+                resource_state[slot_id] = normalized_distance
+            # resource_state[slot_id] = 1
+            
+        return resource_state
+    
     def get_individual_resource_state(self, current_time):
         """
         MODIFICATION: Simplifies the state representation.
@@ -679,8 +714,26 @@ class RLVehicle:
         for data in self.sensing_data:
             slot_id = data.slot_id % self.num_slots
             subchannel_id = data.subchannel
-            
+            #TODO
             # Check for valid subchannel index
+            # if 0 <= subchannel_id < self.num_subchannels:
+
+            #     # --- MODIFICATION START: Incorporate distance ---
+
+            #     # Get the position of the sender from the sensing data
+            #     sender_position = data.sender_position
+
+            #     # Calculate the distance from the current agent to the sender
+            #     distance = np.linalg.norm(self.position - sender_position)
+
+            #     # Normalize the distance: 1 for very close, 0 for out of range
+            #     normalized_distance = max(0.01, 1 - min(1, distance / self.sim.communication_range))
+
+            #     # If this sender is closer than any previously sensed sender for this resource,
+            #     # update the state with the new, higher value.
+            #     if normalized_distance > resource_state[slot_id, subchannel_id]:
+            #         resource_state[slot_id, subchannel_id] = normalized_distance
+            # # Check for valid subchannel index
             if 0 <= subchannel_id < self.num_subchannels:
                 # Mark the resource as occupied (1)
                 resource_state[slot_id, subchannel_id] = 1
@@ -689,8 +742,10 @@ class RLVehicle:
 
     def get_state(self, current_time):
         """Get the current state of the RL agent - including channel state, previous action, and time step"""
-       
-        resource_state_flat = self.get_individual_resource_state(current_time).flatten()
+        if self.sim.use_limit_state:
+            resource_state_flat = self.get_individual_resource_state_limit_state(current_time).flatten()
+        else:
+            resource_state_flat = self.get_individual_resource_state(current_time).flatten()
 
         # 2. Add action history (last 5 actions) - MODIFIED
         action_history_state = np.zeros(5)  # 5 actions, each action is a single value
@@ -769,13 +824,31 @@ class RLVehicle:
     
     def calculate_reward(self, was_successful):
         """Calculates the base reward based on transmission outcome."""
-        current_success_rate = self.successful_sends / self.total_sends if self.total_sends > 0 else 0.0
-        self.last_success_rate = current_success_rate
+        if self.sim.initial_reward:
+            current_success_rate = self.successful_sends / self.total_sends if self.total_sends > 0 else 0.0
+            self.last_success_rate = current_success_rate
+            success_rate_reward = (current_success_rate - self.last_success_rate) * 5.0 # Weighting factor
+            if was_successful:
+                return 2.0 + success_rate_reward  # Reward for successful transmission
+            else:
+                return -8.0 + success_rate_reward # Penalty for collision
+            
+        else:    
+            current_success_rate = self.successful_sends / self.total_sends if self.total_sends > 0 else 0.0
+            self.last_success_rate = current_success_rate
+            # success_rate_reward = np.clip((current_success_rate - self.last_success_rate) * 10.0, -1.0, 1.0) # Weighting factor
+            if was_successful:
+                return 1.0 #+ success_rate_reward  # Reward for successful transmission
+            else:
+                return -2.0 #+ success_rate_reward  # Penalty for collision
+        
+        # current_success_rate = self.successful_sends / self.total_sends if self.total_sends > 0 else 0.0
+        # self.last_success_rate = current_success_rate
         # success_rate_reward = (current_success_rate - self.last_success_rate) * 5.0 # Weighting factor
-        if was_successful:
-            return 1.0   # Reward for successful transmission
-        else:
-            return -2.0 # Penalty for collision
+        # if was_successful:
+        #     return 2.0 + success_rate_reward  # Reward for successful transmission
+        # else:
+        #     return -8.0 + success_rate_reward # Penalty for collision
         
     def add_sensing_data(self, slot_id, subchannel, pRsvp, sender_id, timestamp, sender_position,expected_receivers):
         """Add sensing data from received transmissions"""
@@ -941,6 +1014,75 @@ class RLAttacker:
     #                 if normalized_distance > resource_state[slot_index, sensing_data.subchannel]:
     #                     resource_state[slot_index, sensing_data.subchannel] = normalized_distance
     #     return resource_state
+    def get_individual_resource_state_with_distance(self, current_time):
+        """
+        MODIFICATION: Creates a state representation where resource values are based on
+        the normalized distance to the sender. A closer sender results in a higher value (closer to 1).
+        The state is an absolute representation of the entire pool.
+        """
+        self._update_sensing_window(current_time)
+        # State matrix covers all slots and subchannels, initialized to 0 (free)
+        resource_state = np.zeros((self.num_slots, self.num_subchannels))
+
+        # Iterate through all sensed data points
+        for data in self.sensing_data:
+            slot_id = data.slot_id % self.num_slots
+            subchannel_id = data.subchannel
+
+            # Check for valid subchannel index
+            if 0 <= subchannel_id < self.num_subchannels:
+
+                # --- MODIFICATION START: Incorporate distance ---
+
+                # Get the position of the sender from the sensing data
+                sender_position = data.sender_position
+
+                # Calculate the distance from the current agent to the sender
+                distance = np.linalg.norm(self.position - sender_position)
+
+                # Normalize the distance: 1 for very close, 0 for out of range
+                normalized_distance = max(0, 1 - min(1, distance / self.sim.communication_range))
+
+                # If this sender is closer than any previously sensed sender for this resource,
+                # update the state with the new, higher value.
+                if normalized_distance > resource_state[slot_id, subchannel_id]:
+                    resource_state[slot_id, subchannel_id] = normalized_distance
+
+                # --- MODIFICATION END ---
+
+        return resource_state
+    
+    def get_individual_resource_state_limit_state(self, current_time):
+        """
+        MODIFICATION: Simplifies the state representation to be slot-based.
+        A slot is marked as 1 if any transmission is sensed on any of its subchannels, 
+        0 otherwise. The state is an absolute representation of the entire slot pool.
+        """
+        self._update_sensing_window(current_time)
+        
+        # --- MODIFICATION START ---
+        # State array now only has one dimension for the slots.
+        resource_state = np.zeros(self.num_slots)
+        
+        # Iterate through all sensed data points
+        for data in self.sensing_data:
+            slot_id = data.slot_id % self.num_slots
+            
+            # As soon as we sense a transmission in any subchannel for a given slot,
+            # we mark the entire slot as occupied (1) and can move on.
+            # No need to check which subchannel it was.
+            sender_position = data.sender_position
+
+            # Calculate the distance from the current agent to the sender
+            distance = np.linalg.norm(self.position - sender_position)
+            # Normalize the distance: 1 for very close, 0 for out of range
+            normalized_distance = max(0, 1 - min(1, distance / self.sim.communication_range))
+            # If this sender is closer than any previously sensed sender for this resource,
+            # update the state with the new, higher value.
+            if normalized_distance > resource_state[slot_id]:
+                resource_state[slot_id] = normalized_distance
+            
+        return resource_state
     
     def get_individual_resource_state(self, current_time):
         """
@@ -964,46 +1106,52 @@ class RLAttacker:
                 
         return resource_state
 
-    def get_state(self, current_time):
-        """Get the current state of the RL agent - including channel state, previous action, and time step"""
+    # def get_state(self, current_time):
+    #     """Get the current state of the RL agent - including channel state, previous action, and time step"""
        
-        resource_state_flat = self.get_individual_resource_state(current_time).flatten()
+    #     resource_state_flat = self.get_individual_resource_state(current_time).flatten()
 
-        # 2. Add action history (last 5 actions) - MODIFIED
-        action_history_state = np.zeros(5)  # 5 actions, each action is a single value
+    #     # 2. Add action history (last 5 actions) - MODIFIED
+    #     action_history_state = np.zeros(5)  # 5 actions, each action is a single value
 
-        all_last_actions_state = np.full(self.sim.num_vehicles, -1.0, dtype=np.float32)
-        total_actions = self.sim.action_space[self.id].n
-        for vehicle in self.sim.vehicles:
-            # This part about other vehicles' actions remains the same as it's about observable outcomes
-            if isinstance(vehicle, RLVehicle) and vehicle.action_history:
-                last_action = vehicle.action_history[-1]
-                action_norm = last_action/total_actions
+    #     all_last_actions_state = np.full(self.sim.num_vehicles, -1.0, dtype=np.float32)
+    #     total_actions = self.sim.action_space[self.id].n
+    #     for vehicle in self.sim.vehicles:
+    #         # This part about other vehicles' actions remains the same as it's about observable outcomes
+    #         if isinstance(vehicle, RLVehicle) and vehicle.action_history:
+    #             last_action = vehicle.action_history[-1]
+    #             action_norm = last_action/total_actions
                 
-                all_last_actions_state[vehicle.id] = action_norm
+    #             all_last_actions_state[vehicle.id] = action_norm
 
-        # MODIFIED: New logic for self action history
+    #     # MODIFIED: New logic for self action history
         
-        for i, action in enumerate(self.action_history):
-            if action is not None:
-                action_history_state[i] = action / total_actions
+    #     for i, action in enumerate(self.action_history):
+    #         if action is not None:
+    #             action_history_state[i] = action / total_actions
 
-        # 3. Add time step (normalized)
-        time_norm = np.array([current_time / self.sim.episode_duration])
+    #     # 3. Add time step (normalized)
+    #     time_norm = np.array([current_time / self.sim.episode_duration])
 
-        full_state = np.concatenate([
-            resource_state_flat,         # Channel state
-            action_history_state,      # Action history (5-dimensional)
-            time_norm,                 # Time step (1-dimensional)
-            all_last_actions_state     # Previous actions of other vehicles
-        ])
+    #     full_state = np.concatenate([
+    #         resource_state_flat,         # Channel state
+    #         action_history_state,      # Action history (5-dimensional)
+    #         time_norm,                 # Time step (1-dimensional)
+    #         all_last_actions_state     # Previous actions of other vehicles
+    #     ])
 
-        return full_state.astype(np.float32)
+    #     return full_state.astype(np.float32)
 
 
     def get_state(self, current_time):
         """Get the current state of the RL agent - including channel state, previous action, and time step"""
-        resource_state_flat = self.get_individual_resource_state(current_time).flatten()
+        if self.sim.use_limit_state:
+            resource_state_flat = self.get_individual_resource_state_limit_state(current_time).flatten()
+        else:
+            if self.sim.initial_state:
+                resource_state_flat = self.get_individual_resource_state_with_distance(current_time).flatten()
+            else:
+                resource_state_flat = self.get_individual_resource_state(current_time).flatten()
 
         # 2. Add action history (last 5 actions) - MODIFIED
         action_history_state = np.zeros(5)  # 5 actions, each action is a single value
@@ -1063,56 +1211,105 @@ class RLAttacker:
         return current_resources, resources_changed
 
     def calculate_reward(self, collision_count, affect_vehicles):
+        
         reward = 0.0
+        if self.sim.initial_reward:
+            if collision_count > 0:
+                reward += 3.0 * collision_count
 
-        # 1. Core collision reward (weighted by the number of affected vehicles)
-        if collision_count > 0:
-            # reward += 3.0 * collision_count
-            reward += 1.0
+            # 2. Added: high-value target reward (attacking communication hubs)
+            hub_bonus = 0
+            if affect_vehicles: # Ensure the set is not empty
+                median_expected_receptions = np.median([v.expected_receptions for v in self.sim.vehicles if v.expected_receptions > 0] or [0])
+                for vid in affect_vehicles:
+                    # Check if vid is valid
+                    if 0 <= vid < len(self.sim.vehicles):
+                        vehicle = self.sim.vehicles[vid]
+                        if vehicle.expected_receptions > median_expected_receptions:
+                            hub_bonus += 2.0
+            reward += hub_bonus
+
+            distance_reward = 0.0
+            for affected_vehicle_id in affect_vehicles:
+                if 0 <= affected_vehicle_id < len(self.sim.vehicles):
+                    # Calculate the distance between the attacker and the affected vehicle
+                    dist = np.linalg.norm(np.array(self.position) - np.array(self.sim.vehicles[affected_vehicle_id].position))
+
+                    # Give a reward based on the distance
+                    if dist < 50:
+                        distance_reward += 1.0  # High reward for close distance
+                    elif dist < 320:
+                        # Linearly decay between 50-300 meters
+                        distance_reward += 1.0 * (1 - (dist - 50) / 320)
+            reward += distance_reward
+
+            # if len(affect_vehicles)>1:
+            #     reward -= 2.0*(len(affect_vehicles)-1)
+            # 3. Efficiency reward (simplified version)
+            # current_success_rate = self.attack_success_count / max(1, self.attack_packets_sent)
+            # reward += 10.0 * (current_success_rate - self.last_attack_success_rate)
+
+            # 4. Penalty term
+            if collision_count == 0:
+                reward -= 5.0  # Penalty for not causing a collision
+
+            # self.last_attack_success_rate = current_success_rate
+            return np.clip(reward, -10.0, 15.0)
+        else:
+            if collision_count > 0:
+                reward += 1.0
+            current_success_rate = self.attack_success_count / max(1, self.attack_packets_sent)
+            if collision_count == 0:
+                reward -= 2.0  # Penalty for not causing a collision
+            self.last_attack_success_rate = current_success_rate
+            return np.clip(reward, -2.0, 2.0)
+       
+            
 
         # 2. Added: high-value target reward (attacking communication hubs)
-        hub_bonus = 0
-        if affect_vehicles: # Ensure the set is not empty
-            # median_expected_receptions = np.median([v.expected_receptions for v in self.sim.vehicles if v.expected_receptions > 0] or [0])
-            for vid in affect_vehicles:
-                vehicle = self.sim.vehicles[vid]
-                hub_bonus += 1.0 * vehicle.expected_receptions / max(1, self.sim.num_vehicles)
-            #     # Check if vid is valid
-            #     if 0 <= vid < len(self.sim.vehicles):
-            #         vehicle = self.sim.vehicles[vid]
-            #         if vehicle.expected_receptions > median_expected_receptions:
-            #             hub_bonus += 2.0    
-        reward += hub_bonus
+        # hub_bonus = 0
+        # if affect_vehicles: # Ensure the set is not empty
+        #     # median_expected_receptions = np.median([v.expected_receptions for v in self.sim.vehicles if v.expected_receptions > 0] or [0])
+        #     for vid in affect_vehicles:
+        #         vehicle = self.sim.vehicles[vid]
+        #         hub_bonus += 1.0 * vehicle.expected_receptions / max(1, self.sim.num_vehicles)
+        #     #     # Check if vid is valid
+        #     #     if 0 <= vid < len(self.sim.vehicles):
+        #     #         vehicle = self.sim.vehicles[vid]
+        #     #         if vehicle.expected_receptions > median_expected_receptions:
+        #     #             hub_bonus += 2.0    
+        # reward += hub_bonus
 
-        distance_reward = 0.0
-        for affected_vehicle_id in affect_vehicles:
-            if 0 <= affected_vehicle_id < len(self.sim.vehicles):
-                # Calculate the distance between the attacker and the affected vehicle
-                dist = np.linalg.norm(np.array(self.position) - np.array(self.sim.vehicles[affected_vehicle_id].position))
+        # distance_reward = 0.0
+        # for affected_vehicle_id in affect_vehicles:
+        #     if 0 <= affected_vehicle_id < len(self.sim.vehicles):
+        #         # Calculate the distance between the attacker and the affected vehicle
+        #         dist = np.linalg.norm(np.array(self.position) - np.array(self.sim.vehicles[affected_vehicle_id].position))
 
-                # Give a reward based on the distance
-                if dist < 50:
-                    distance_reward += 1.0  # High reward for close distance
-                elif dist < 320:
-                    # Linearly decay between 50-300 meters
-                    distance_reward += 1.0 * (1 - (dist - 50) / 320)
-        reward += distance_reward
+        #         # Give a reward based on the distance
+        #         if dist < 50:
+        #             distance_reward += 1.0  # High reward for close distance
+        #         elif dist < 320:
+        #             # Linearly decay between 50-300 meters
+        #             distance_reward += 1.0 * (1 - (dist - 50) / 320)
+        # reward += distance_reward
 
         # # if len(affect_vehicles)>1:
         # #     reward -= 2.0*(len(affect_vehicles)-1)
         # # 3. Efficiency reward (simplified version)
-        current_success_rate = self.attack_success_count / max(1, self.attack_packets_sent)
-        # reward += 10.0 * (current_success_rate - self.last_attack_success_rate)
+        # current_success_rate = self.attack_success_count / max(1, self.attack_packets_sent)
+        # ratio_reward = np.clip(10*(current_success_rate - self.last_attack_success_rate), -1.0, 1.0)
+        # reward += ratio_reward
 
         # # 4. Penalty term
         # if collision_count == 0:
         #     reward -= 5.0  # Penalty for not causing a collision
-        if collision_count == 0:
-            reward -= 2.0  # Penalty for not causing a collision
+        # if collision_count == 0:
+        #     reward -= 2.0  # Penalty for not causing a collision
 
 
-        self.last_attack_success_rate = current_success_rate
-        return np.clip(reward, -2.0, 3.0)
+        # self.last_attack_success_rate = current_success_rate
+        # return np.clip(reward, -2.0, 2.0)
 
     def record_attack_success(self, collision_occurred):
         """Record successful attacks"""
@@ -1445,11 +1642,67 @@ class V2XRLEnvironment(gym.Env):
         self.use_simple_interference = kwargs.get('use_simple_interference', False)
         self.print_detail = False
         self.use_rl_vehicles = kwargs.get('use_rl_vehicles', False)
-        self.attacker_target_ids = [1] if self.num_attackers == 1 else [-1,-1]
+        self.attacker_target_ids = [1] if self.num_attackers == 1 else [-1] * self.num_attackers
         self.use_adversarial_attacker = kwargs.get('use_adversarial_attacker', False)
+        
         self.use_pretrained_rl_vehicles = kwargs.get('use_pretrained_rl_vehicles', False)
         self.rl_vehicle_model_path = kwargs.get('rl_vehicle_model_path', None)
+        self.use_limit_state = kwargs.get('use_limit_state', False)
+
+        self.use_pretrained_rl_attackers = kwargs.get('use_pretrained_rl_attackers', False)
+        self.rl_attacker_model_path = kwargs.get('rl_attacker_model_path', None)
+    
+        rl_attacker_config_path = kwargs.get('rl_attacker_config_path', None)
         rl_vehicle_config_path = kwargs.get('rl_vehicle_config_path', None)
+        
+        self.mode = kwargs.get('mode', 'train_attacker')
+        self.initial_reward = True
+        self.initial_state = False
+        # # --- Set internal flags based on the chosen mode ---
+        # print(f"--- V2X Environment Initializing in Mode: '{self.mode}' ---")
+        # if self.mode == 'train_vehicle':
+        #     self.use_rl_vehicles = True
+        #     self.use_pretrained_rl_vehicles = False
+        #     self.use_pretrained_rl_attackers = False
+        #     self.attacker_type = 'Fix'  # Default opponent
+        # elif self.mode == 'train_attacker':
+        #     self.use_rl_vehicles = False
+        #     self.use_pretrained_rl_vehicles = False
+        #     self.use_pretrained_rl_attackers = False
+        #     self.attacker_type = 'RL'
+        # elif self.mode == 'eval_fix_attacker':
+        #     self.use_rl_vehicles = False
+        #     self.use_pretrained_rl_vehicles = False
+        #     self.use_pretrained_rl_attackers = False
+        #     self.attacker_type = 'Fix'
+        # elif self.mode == 'train_attacker_vs_pretrained_vehicle':
+        #     self.use_rl_vehicles = False
+        #     self.use_pretrained_rl_vehicles = True
+        #     self.use_pretrained_rl_attackers = False
+        #     self.attacker_type = 'RL'
+        # elif self.mode == 'train_vehicle_vs_pretrained_attacker':
+        #     self.use_rl_vehicles = True
+        #     self.use_pretrained_rl_vehicles = False
+        #     self.use_pretrained_rl_attackers = True
+        #     self.attacker_type = 'RL'
+        # elif self.mode == 'eval_pretrained_attacker':
+        #     self.use_rl_vehicles = False
+        #     self.use_pretrained_rl_vehicles = False
+        #     self.use_pretrained_rl_attackers = True
+        #     self.attacker_type = 'RL'
+        # elif self.mode == 'eval_pretrained_vehicle':
+        #     self.use_rl_vehicles = False  # Set to False so framework controls a dummy attacker
+        #     self.use_pretrained_rl_vehicles = True
+        #     self.use_pretrained_rl_attackers = False
+        #     self.attacker_type = 'Fix' # or 'None' if num_attackers is 0
+        # elif self.mode == 'eval_pretrained_vehicle_vs_pretrained_attacker':
+        #     self.use_rl_vehicles = False # Framework can control dummy attackers
+        #     self.use_pretrained_rl_vehicles = True
+        #     self.use_pretrained_rl_attackers = True
+        #     self.attacker_type = 'RL'
+        # else:
+        #     raise ValueError(f"Unknown environment mode: {self.mode}")
+        
         if self.use_pretrained_rl_vehicles and rl_vehicle_config_path:
             # 如果提供了配置文件路径
             print(f"Loading RLVehicle config from: {rl_vehicle_config_path}")
@@ -1462,6 +1715,106 @@ class V2XRLEnvironment(gym.Env):
         else:
             # 如果没有提供路径，则沿用旧的逻辑（以防万一）
             self.rl_vehicle_args = kwargs.get('rl_vehicle_args', None)
+
+        if self.use_pretrained_rl_attackers and rl_attacker_config_path:
+            print(f"Loading RLAttacker config from: {rl_attacker_config_path}")
+            with open(rl_attacker_config_path, 'r') as f:
+                config = json.load(f)
+                algo_args = config.get('algo_args', {})
+                self.rl_attacker_args = {**algo_args.get('algo', {}), **algo_args.get('model', {})}
+        else:
+            self.rl_attacker_args = kwargs.get('rl_attacker_args', None)
+            
+        
+        # # Determine number of agents for the framework
+        # if self.use_rl_vehicles:
+        #     self.n_agents = self.num_vehicles
+        # else:
+        #     self.n_agents = self.num_attackers if self.num_attackers > 0 else self.num_vehicles
+
+        # self.num_agents = self.n_agents
+        
+        # # --- MAJOR FIX: Always define the full observation and action space ---
+        # # This prevents the broadcast error by ensuring buffers are always correctly sized.
+        # if self.num_subchannels <= 1:
+        #     num_subchannel_choices = 1
+        # else:
+        #     num_subchannel_choices = self.num_subchannels - 1
+        
+        # # Define space dimensions for a vehicle
+        # if self.use_limit_state:
+        #     vehicle_obs_dim_base = self.num_slots
+        # else:
+        #     vehicle_obs_dim_base = self.num_slots * self.num_subchannels
+        # vehicle_obs_dim = vehicle_obs_dim_base + 5 + 1 + self.num_vehicles
+        # vehicle_action_dim = self.num_slots * num_subchannel_choices
+
+        # # Define space dimensions for an attacker
+        # if self.use_limit_state:
+        #     attacker_obs_dim_base = self.num_slots
+        # else:
+        #     attacker_obs_dim_base = self.num_slots * self.num_subchannels
+        # attacker_obs_dim = attacker_obs_dim_base + 5 + 1
+        # attacker_action_dim = self.num_slots * num_subchannel_choices
+        
+        # # Set the environment's spaces based on who is being trained/controlled
+        # if self.use_rl_vehicles:
+        #     final_obs_dim = vehicle_obs_dim
+        #     total_actions = vehicle_action_dim
+        # else:
+        #     final_obs_dim = attacker_obs_dim
+        #     total_actions = attacker_action_dim
+
+        # self.action_space = [spaces.Discrete(total_actions) for _ in range(self.n_agents)]
+        # self.observation_space = [
+        #     spaces.Box(low=-np.inf, high=np.inf, shape=(final_obs_dim,), dtype=np.float32)
+        #     for _ in range(self.n_agents)
+        # ]
+        # share_obs_dim = self.num_slots * self.num_subchannels
+        # self.share_observation_space = [
+        #      spaces.Box(low=0.0, high=1.0, shape=(share_obs_dim,), dtype=np.float32)
+        #      for _ in range(self.n_agents)]
+        
+        # self.multi_agent_coordination = True if self.n_agents > 1 else False
+        # # Initialize other components
+        # self.sinr_calculator = SINRCalculator(tx_power=self.tx_power, noise_power=self.noise_power)
+        # self.resource_pool = ResourcePool(num_slots=self.num_slots, num_subchannels=self.num_subchannels)
+        
+        # self.vehicles = []
+        # self.attackers = []
+        # self._initialize_vehicles()
+        # self._initialize_attackers()
+        
+        # # Load models if required
+        # self.pretrained_vehicle_actors = []
+        # if self.use_pretrained_rl_vehicles:
+        #     self._load_pretrained_vehicle_models()
+            
+        # self.pretrained_attacker_actors = []
+        # if self.use_pretrained_rl_attackers:
+        #     self._load_pretrained_attacker_models()
+        
+        
+        # # Reset all stats and timers
+        # self.current_time = 0
+        # self.step_count = 0
+        # self.step_duration = self.num_slots
+        # self.resource_pool = ResourcePool(num_slots=self.num_slots, num_subchannels=self.num_subchannels, subchannel_size=10)
+        # self.initial_vehicle_states = None
+        # self.initial_attacker_states = None
+
+        # self.recent_collision_queue = deque(maxlen=100)
+        # self.recent_collision_rate = 0.0
+        # self.last_global_prr = 1.0
+        # self.message_status_dict = {}
+        # self.message_pool = {}
+        # self.sinr_records = []
+        # self.resource_transmission_count = 0
+        # self.attack_effect_records = []
+        # self.verbose_attack_output = True
+        # self.resource_grid = [ [ [] for _ in range(self.num_subchannels)] for _ in range(self.num_slots) ]
+        # self.reset_stats()
+ 
         if self.use_pretrained_rl_vehicles:
             self.n_agents = self.num_attackers
             self.use_rl_vehicles = False # This flag is now for training RL vehicles
@@ -1519,18 +1872,26 @@ class V2XRLEnvironment(gym.Env):
         #     self.vehicle_action_space = spaces.Discrete(total_actions)
 
         if self.use_rl_vehicles: # Training RL Vehicles
-            obs_dim = self.num_slots * self.num_subchannels
+            if self.use_limit_state:
+                obs_dim = self.num_slots  # Only slots, no subchannels
+            else:
+                obs_dim = self.num_slots * self.num_subchannels
             total_actions = self.num_slots * num_subchannel_choices
             action_history_dim = 5
             time_dim = 1
             other_actions_dim = self.num_vehicles
             final_obs_dim = obs_dim + action_history_dim + time_dim + other_actions_dim
         else: # Training RL Attacker
-            obs_dim = self.num_slots * self.num_subchannels
-            total_actions = self.num_slots * num_subchannel_choices
-            action_history_dim = 5
-            time_dim = 1
-            final_obs_dim = obs_dim + action_history_dim + time_dim
+            if self.attacker_type == 'RL':
+                if self.use_limit_state:
+                    obs_dim = self.num_slots  # Only slots, no subchannels
+                else:
+                    obs_dim = self.num_slots * self.num_subchannels
+                total_actions = self.num_slots * num_subchannel_choices
+                action_history_dim = 5
+                time_dim = 1
+                final_obs_dim = obs_dim + action_history_dim + time_dim
+            
 
         # Handle the case where there are no RL agents to avoid errors
         if (self.attacker_type != 'RL' and not self.use_rl_vehicles and not self.use_pretrained_rl_vehicles):
@@ -1563,19 +1924,33 @@ class V2XRLEnvironment(gym.Env):
         self.pretrained_vehicle_actors = []
         if self.use_pretrained_rl_vehicles:
             self._load_pretrained_vehicle_models()
+            
+        self.pretrained_attacker_actors = []
+        if self.use_pretrained_rl_attackers:
+            self._load_pretrained_attacker_models()
 
     
-    # def _load_pretrained_vehicle_models(self):
-    #     if self.rl_vehicle_model_path is None or self.rl_vehicle_args is None:
-    #         raise ValueError("rl_vehicle_model_path and rl_vehicle_args must be provided when use_pretrained_rl_vehicles is True")
+    def _load_pretrained_vehicle_models(self):
+        if self.rl_vehicle_model_path is None or self.rl_vehicle_args is None:
+            raise ValueError("rl_vehicle_model_path and rl_vehicle_args must be provided when use_pretrained_rl_vehicles is True")
 
-    #     for i in range(self.num_vehicles):
-    #         # Assuming rl_vehicle_args is a dict that can be used to initialize the actor
-    #         actor = StochasticPolicy(self.rl_vehicle_args, self.observation_space[0], self.action_space[0]) 
-    #         actor_state_dict = torch.load(f"{self.rl_vehicle_model_path}/actor_agent{i}.pt", weights_only=True)
-    #         actor.load_state_dict(actor_state_dict)
-    #         actor.eval()
-    #         self.pretrained_vehicle_actors.append(actor)
+        for i in range(self.num_vehicles):
+            # Assuming rl_vehicle_args is a dict that can be used to initialize the actor
+            actor = StochasticPolicy(self.rl_vehicle_args, self.observation_space[0], self.action_space[0]) 
+            actor_state_dict = torch.load(f"{self.rl_vehicle_model_path}/actor_agent{i}.pt", weights_only=True)
+            actor.load_state_dict(actor_state_dict)
+            actor.eval()
+            self.pretrained_vehicle_actors.append(actor)
+    
+    # def _load_model_config(self, config_path):
+    #         if not config_path:
+    #             return None
+    #         print(f"Loading model config from: {config_path}")
+    #         with open(config_path, 'r') as f:
+    #             config = json.load(f)
+    #             algo_args = config.get('algo_args', {})
+    #             return {**algo_args.get('algo', {}), **algo_args.get('model', {})}
+            
     def _load_pretrained_vehicle_models(self):
         if self.rl_vehicle_model_path is None or self.rl_vehicle_args is None:
             raise ValueError("rl_vehicle_model_path and rl_vehicle_args must be provided when use_pretrained_rl_vehicles is True")
@@ -1607,7 +1982,37 @@ class V2XRLEnvironment(gym.Env):
             actor.eval()
             self.pretrained_vehicle_actors.append(actor)
 
+    def _load_pretrained_attacker_models(self):
+        """Loads pre-trained actor models for RLAttacker agents."""
+        if self.rl_attacker_model_path is None or self.rl_attacker_args is None:
+            raise ValueError("rl_attacker_model_path and rl_attacker_args must be provided when training against pre-trained attackers.")
 
+        # Define the correct spaces for the ATTACKER model LOCALLY
+        if self.num_subchannels <= 1:
+            num_subchannel_choices = 1
+        else:
+            num_subchannel_choices = self.num_subchannels - 1
+
+        # Calculate the exact observation dimension for the pre-trained RLAttacker
+        if self.use_limit_state:
+            obs_dim = self.num_slots
+        else:
+            obs_dim = self.num_slots * self.num_subchannels
+        attacker_obs_dim = obs_dim + 5 + 1  # resource_state + action_history + time
+        attacker_total_actions = self.num_slots * num_subchannel_choices
+        
+        attacker_obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(attacker_obs_dim,), dtype=np.float32)
+        attacker_act_space = spaces.Discrete(attacker_total_actions)
+
+        print(f"Loading pre-trained RLAttacker models with obs_dim={attacker_obs_dim} and act_dim={attacker_total_actions}")
+        self.pretrained_attacker_actors = []
+        for i in range(self.num_attackers):
+            actor = StochasticPolicy(self.rl_attacker_args, attacker_obs_space, attacker_act_space)
+            actor_state_dict = torch.load(f"{self.rl_attacker_model_path}/actor_agent{i}.pt", weights_only=True)
+            actor.load_state_dict(actor_state_dict)
+            actor.eval()
+            self.pretrained_attacker_actors.append(actor)
+            
     def seed(self, seed=None):
         if seed is not None:
             np.random.seed(seed)
@@ -1620,7 +2025,7 @@ class V2XRLEnvironment(gym.Env):
         """
         resource_grid = np.zeros((self.num_slots, self.num_subchannels), dtype=np.float32)
 
-        for vehicle in self.vehicles:
+        for vehicle in self.vehicles + self.attackers:
             if vehicle.current_resources:
                 for resource in vehicle.current_resources:
                     if 0 <= resource.slot_id < self.num_slots and 0 <= resource.subchannel < self.num_subchannels:
@@ -1704,65 +2109,163 @@ class V2XRLEnvironment(gym.Env):
         """
         self.step_count += 1
         
-        # --- 1. Action and Resource Selection Phase ---
-        attacker_action_resources = defaultdict(list)
+        # # --- 1. Action and Resource Selection Phase ---
+        # attacker_action_resources = defaultdict(list)
         
-        # RL agents select resources based on actions
-        if self.use_rl_vehicles:
-            for i, vehicle in enumerate(self.vehicles):
-                if isinstance(vehicle, RLVehicle):
-                    resources, _ = vehicle.select_send_resources(actions[i])
-                    vehicle.current_resources = resources
-        else: # RL Attackers
-            for i, attacker in enumerate(self.attackers):
-                if isinstance(attacker, RLAttacker):
-                    resources, _ = attacker.select_attack_resources(actions[i])
-                    attacker.current_resources = resources
-                    attacker_action_resources[attacker.id] = resources
-                    attacker.sent_resources_count = 0
-                    
-        if self.use_pretrained_rl_vehicles:
-            with torch.no_grad():
-                for i, vehicle in enumerate(self.vehicles):
-                    if isinstance(vehicle, RLVehicle):
+        # # RL agents select resources based on actions
+        # if self.use_rl_vehicles:
+        #     for i, vehicle in enumerate(self.vehicles):
+        #         if isinstance(vehicle, RLVehicle):
+        #             resources, _ = vehicle.select_send_resources(actions[i])
+        #             vehicle.current_resources = resources
+        # else: # RL Attackers
+        #     if not self.use_pretrained_rl_attackers:
+        #         for i, attacker in enumerate(self.attackers):
+        #             if isinstance(attacker, RLAttacker):
+        #                 resources, _ = attacker.select_attack_resources(actions[i])
+        #                 attacker.current_resources = resources
+        #                 attacker_action_resources[attacker.id] = resources
+        #                 attacker.sent_resources_count = 0
+        #                 attacker.attack_success_this_step = False
+           
+                                   
+        # if self.use_pretrained_rl_vehicles:
+        #     with torch.no_grad():
+        #         for i, vehicle in enumerate(self.vehicles):
+        #             if isinstance(vehicle, RLVehicle):
+        #                 obs = vehicle.get_state(self.current_time)
+        #                 hidden_size = self.rl_vehicle_args['hidden_sizes'][0]
+        #                 dummy_rnn_states = torch.zeros((1, 1, hidden_size))
+        #                 dummy_masks = torch.ones((1, 1))
+        #                 action, _, _ = self.pretrained_vehicle_actors[i](
+        #             torch.tensor(obs, dtype=torch.float32).unsqueeze(0),
+        #             dummy_rnn_states,
+        #             dummy_masks
+        #         )
+        #                 resources, _ = vehicle.select_send_resources(action.item())
+        #                 vehicle.current_resources = resources
+                        
+        # if not self.use_rl_vehicles and not self.use_pretrained_rl_vehicles:
+        #     # Non-RL agents select their resources
+        #     for vehicle in self.vehicles:
+        #         if isinstance(vehicle, Vehicle):
+        #             if self.current_time%self.num_slots==0:
+        #                 vehicle.has_transmitted = False
+        #             if not vehicle.has_transmitted:
+        #                 vehicle.handle_periodic_resource_reselection(self.current_time)
+        #                 vehicle.has_transmitted = True
+
+        #                 if vehicle.resel_counter > 0:
+        #                     vehicle.resel_counter -= 1
+
+
+        #                 vehicle.transmission_on_current_resource_counter += 1
+        #                 vehicle.sent_resources_count = 0
+        #         # tx_results = vehicle.send_packet(self.current_time)
+        #         # # print("fale",self.current_time)
+        #         # if tx_results:
+        #         #     print("sender:",tx_results[0][1].slot_id,tx_results[0][1].subchannel ,self.current_time)
+        # if self.use_pretrained_rl_attackers and self.attacker_type == 'RL':
+        #     with torch.no_grad():
+        #         for i, attacker in enumerate(self.attackers):
+        #             if isinstance(attacker, RLAttacker):
+        #                 obs = attacker.get_state(self.current_time)
+        #                 hidden_size = self.rl_attacker_args['hidden_sizes'][0]
+        #                 dummy_rnn_states = torch.zeros((1, 1, hidden_size))
+        #                 dummy_masks = torch.ones((1, 1))
+        #                 action, _, _ = self.pretrained_attacker_actors[i](
+        #                     torch.tensor(obs, dtype=torch.float32).unsqueeze(0),
+        #                     dummy_rnn_states,
+        #                     dummy_masks
+        #                 )
+        #                 resources, _ = attacker.select_attack_resources(action.item())
+        #                 attacker.current_resources = resources
+        #                 attacker.sent_resources_count = 0
+        #                 attacker.attack_success_this_step = False  
+                        
+        # if not self.use_pretrained_rl_attackers and self.attacker_type == 'Fix':
+        #     for attacker in self.attackers:
+        #         if isinstance(attacker, FixAttacker):
+        #             attacker.select_and_set_resources(self.current_time)
+        #         # tx_results = attacker.send_packet(self.current_time)
+        #         # if tx_results:
+        #         #     print("**attacker:",tx_results[0][1].slot_id,tx_results[0][1].subchannel,self.current_time)
+        
+        attacker_action_resources = defaultdict(list)
+
+        # --- A. Select resources for ALL vehicles ---
+        for i, vehicle in enumerate(self.vehicles):
+            # PRIORITY 1: Is it an RL-based vehicle (learning or pre-trained)?
+            if isinstance(vehicle, RLVehicle):
+                # HIGHEST PRIORITY: Use pre-trained model if available.
+                if self.use_pretrained_rl_vehicles:
+                    with torch.no_grad():
                         obs = vehicle.get_state(self.current_time)
                         hidden_size = self.rl_vehicle_args['hidden_sizes'][0]
                         dummy_rnn_states = torch.zeros((1, 1, hidden_size))
                         dummy_masks = torch.ones((1, 1))
                         action, _, _ = self.pretrained_vehicle_actors[i](
-                    torch.tensor(obs, dtype=torch.float32).unsqueeze(0),
-                    dummy_rnn_states,
-                    dummy_masks
-                )
+                            torch.tensor(obs, dtype=torch.float32).unsqueeze(0),
+                            dummy_rnn_states,
+                            dummy_masks
+                        )
                         resources, _ = vehicle.select_send_resources(action.item())
                         vehicle.current_resources = resources
-        else:
-            # Non-RL agents select their resources
-            for vehicle in self.vehicles:
-                if isinstance(vehicle, Vehicle):
-                    if self.current_time%self.num_slots==0:
-                        vehicle.has_transmitted = False
-                    if not vehicle.has_transmitted:
-                        vehicle.handle_periodic_resource_reselection(self.current_time)
-                        vehicle.has_transmitted = True
-
-                        if vehicle.resel_counter > 0:
-                            vehicle.resel_counter -= 1
-
-
-                        vehicle.transmission_on_current_resource_counter += 1
-                        vehicle.sent_resources_count = 0
-                # tx_results = vehicle.send_packet(self.current_time)
-                # # print("fale",self.current_time)
-                # if tx_results:
-                #     print("sender:",tx_results[0][1].slot_id,tx_results[0][1].subchannel ,self.current_time)
+                        # print("pre-trained vehicle action:",[(r.slot_id,r.subchannel) for r in resources],self.current_time)
+                # If not pre-trained, check if it's a learning agent.
+                elif self.use_rl_vehicles:
+                    resources, _ = vehicle.select_send_resources(actions[i])
+                    vehicle.current_resources = resources
+                    # print("RL vehicle action:",[(r.slot_id,r.subchannel) for r in resources],self.current_time)
+            
+            # PRIORITY 2: If not an RL vehicle, it must be a rule-based Vehicle.
+            elif isinstance(vehicle, Vehicle):
+                if self.current_time % self.num_slots == 0:
+                    vehicle.has_transmitted = False
+                if not vehicle.has_transmitted:
+                    vehicle.handle_periodic_resource_reselection(self.current_time)
+                    vehicle.has_transmitted = True
+                    if vehicle.resel_counter > 0:
+                        vehicle.resel_counter -= 1
+                    vehicle.transmission_on_current_resource_counter += 1
+                    vehicle.sent_resources_count = 0
+                    # print("Fix vehicle action:",[(r.slot_id,r.subchannel) for r in vehicle.current_resources],self.current_time)
         
-        for attacker in self.attackers:
-            if isinstance(attacker, FixAttacker):
+        # --- B. Select resources for ALL attackers ---
+        for i, attacker in enumerate(self.attackers):
+            # PRIORITY 1: Is it an RL-based attacker (learning or pre-trained)?
+            if isinstance(attacker, RLAttacker):
+                # HIGHEST PRIORITY: Use pre-trained model if available.
+                if self.use_pretrained_rl_attackers:
+                    with torch.no_grad():
+                        obs = attacker.get_state(self.current_time)
+                        hidden_size = self.rl_attacker_args['hidden_sizes'][0]
+                        dummy_rnn_states = torch.zeros((1, 1, hidden_size))
+                        dummy_masks = torch.ones((1, 1))
+                        action, _, _ = self.pretrained_attacker_actors[i](
+                            torch.tensor(obs, dtype=torch.float32).unsqueeze(0),
+                            dummy_rnn_states,
+                            dummy_masks
+                        )
+                        resources, _ = attacker.select_attack_resources(action.item())
+                        attacker.current_resources = resources
+                    # print("pre-trained attacker action:",[(r.slot_id,r.subchannel) for r in resources],self.current_time)
+                # If not pre-trained, check if it's a learning agent.
+                elif not self.use_rl_vehicles:
+                    resources, _ = attacker.select_attack_resources(actions[i])
+                    attacker.current_resources = resources
+                    attacker_action_resources[attacker.id] = resources
+                    # print("RL attacker action:",[(r.slot_id,r.subchannel) for r in resources],self.current_time)
+                
+                # Common reset for RLAttacker
+                attacker.sent_resources_count = 0
+                attacker.attack_success_this_step = False
+
+            # PRIORITY 2: If not an RL attacker, it must be a rule-based FixAttacker.
+            elif isinstance(attacker, FixAttacker):
                 attacker.select_and_set_resources(self.current_time)
-                # tx_results = attacker.send_packet(self.current_time)
-                # if tx_results:
-                #     print("**attacker:",tx_results[0][1].slot_id,tx_results[0][1].subchannel,self.current_time)
+                # print("Fix attacker action:",[(r.slot_id,r.subchannel) for r in attacker.current_resources],self.current_time)
+                
 
         # --- 2. Transmission Aggregation & Outcome Resolution Phase ---
         resource_usage_map = defaultdict(list)
@@ -1801,22 +2304,28 @@ class V2XRLEnvironment(gym.Env):
             for vehicle_set in step_outcomes['attacker_impact'].values():
                 affected_vehicles.update(vehicle_set)
             total_collision_caused_due_to_attack = len(affected_vehicles)
-            
+        # print("Total collisions caused due to attack:", total_collision_caused_due_to_attack)
         # --- 3. Reward Calculation Phase ---
         rewards = []
         #TODO 修改了RLVehicle奖励
         if self.use_rl_vehicles:
             team_reward = 0.0
             current_prr = self._calculate_current_prr()
-            prr_reward = (current_prr - self.last_global_prr) * 10.0
-            prr_reward = np.clip(prr_reward, -0.5, 0.5)
+            if self.initial_reward:
+                prr_reward = (current_prr - self.last_global_prr) * 20.0
+            # self.last_global_prr = current_prr
+            # prr_reward = (current_prr - self.last_global_prr) * 10.0
+            # prr_reward = np.clip(prr_reward, -0.5, 0.5)
             self.last_global_prr = current_prr
             
             successful_tx = sum(1 for success in step_outcomes['rl_vehicle_status'].values() if success)
-            if successful_tx > 16:
-                team_reward += 1
-            else:
-                team_reward -= 1
+            if self.initial_reward:
+                team_reward = 2*(successful_tx - 17)
+            else:   
+                if successful_tx >= 17:
+                    team_reward += 1.0 * ((self.num_vehicles-successful_tx) / 3)
+                else:
+                    team_reward -= 1.0 * (17-successful_tx) / 10
 
             for vehicle in self.vehicles:
                 if isinstance(vehicle, RLVehicle):
@@ -1825,23 +2334,60 @@ class V2XRLEnvironment(gym.Env):
                     if was_successful: vehicle.successful_sends += 1
                     
                     individual_reward = vehicle.calculate_reward(was_successful)
-                    final_reward = individual_reward + team_reward + prr_reward
+                    # final_reward = individual_reward + team_reward + prr_reward
+                    if self.initial_reward:
+                        final_reward = individual_reward + team_reward + prr_reward
+                    else:
+                        final_reward = 0.75*individual_reward + 0.25*team_reward
                     rewards.append([final_reward])
                 else:
                     rewards.append([0.0])
-        elif self.attacker_type == 'RL':
+            # current_prr = self._calculate_current_prr()
+            # prr_reward = (current_prr - self.last_global_prr) * 20.0
+            # self.last_global_prr = current_prr
+            
+            # successful_tx = sum(1 for success in step_outcomes['rl_vehicle_status'].values() if success)
+            # team_reward = 2 * (successful_tx - 16) 
+
+            # for vehicle in self.vehicles:
+            #     if isinstance(vehicle, RLVehicle):
+            #         was_successful = step_outcomes['rl_vehicle_status'].get(vehicle.id, False)
+            #         vehicle.total_sends += 1
+            #         if was_successful: vehicle.successful_sends += 1
+                    
+            #         individual_reward = vehicle.calculate_reward(was_successful)
+            #         final_reward = individual_reward + team_reward + prr_reward
+            #         rewards.append([final_reward])
+            #     else:
+            #         rewards.append([0.0])
+        elif self.attacker_type == 'RL' and not self.use_pretrained_rl_attackers:
             if not self.use_adversarial_attacker:
                 team_reward = 0
+                # team_reward = 0
                 if self.n_agents > 1 and self.multi_agent_coordination:
                     resource_list = [res for res_list in attacker_action_resources.values() for res in res_list]
                     num_overlaps = len(resource_list) - len(set(resource_list))
-                    if num_overlaps > 0:
-                        team_reward -= 1.0
+                    team_reward -= num_overlaps * 3.0
+                    if len(step_outcomes['attacker_impact']) >= self.n_agents:
+                        team_reward += 3.0
+
+                # if self.n_agents > 1 and self.multi_agent_coordination:
+                #     resource_list = [res for res_list in attacker_action_resources.values() for res in res_list]
+                #     num_overlaps = len(resource_list) - len(set(resource_list))
+                #     if num_overlaps > 0:
+                #         if self.initial_reward:
+                #             team_reward -= 3.0 * (num_overlaps/2)
+                #         else:
+                #             team_reward -= 1.0
                 #     # resource_list = [res for res_list in attacker_action_resources.values() for res in res_list]
                 #     # num_overlaps = len(resource_list) - len(set(resource_list))
                 #     # team_reward -= num_overlaps * 3.0
-                if total_collision_caused_due_to_attack >= 2:
-                    team_reward += 1.0
+                    # all_success = all(attacker.attack_success_this_step for attacker in self.attackers if isinstance(attacker, RLAttacker))
+                    # if all_success:
+                    #     if self.initial_reward:
+                    #         team_reward += 3.0
+                    #     else:
+                    #         team_reward += 1.0
                 # print(team_reward,total_collision_caused_due_to_attack)
 
                 for attacker in self.attackers:
@@ -1852,16 +2398,19 @@ class V2XRLEnvironment(gym.Env):
                         attacker.attack_packets_sent += len(attacker.current_resources)
 
                         individual_reward = attacker.calculate_reward(collision_count, affected_vehicles)
-                        rewards.append([0.6*individual_reward + 0.4*team_reward])
+                        if self.initial_reward:
+                            rewards.append([individual_reward + team_reward])
+                        else:
+                            rewards.append([0.75*individual_reward + 0.25*team_reward])
             else:
                 collisions_caused_this_step = step_outcomes['collisions_caused_this_step']
                 for attacker in self.attackers:
                     if isinstance(attacker, RLAttacker):
                         if collisions_caused_this_step > 0:
-                            reward = (collisions_caused_this_step/2)/(len(self.vehicles)/2)
+                            reward = (collisions_caused_this_step/2)/(len(self.vehicles))
                             rewards.append([reward])
                         else:
-                            rewards.append([-0.2])
+                            rewards.append([-1.0])
         else:
             rewards = [[0.0] for _ in range(self.n_agents)]
 
@@ -2022,6 +2571,7 @@ class V2XRLEnvironment(gym.Env):
                     for attacker in attackers:
                         for vehicle in normal_vehicles:
                             outcomes['attacker_impact'][attacker.id].add(vehicle.id)
+                            attacker.attack_success_this_step = True
                 self.attack_transmission_count +=1
 
             # --- SINR Calculation: Gather success status for each resource block ---

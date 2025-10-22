@@ -44,7 +44,7 @@ def visualize_slot_usage(json_file_path, output_dir='slot_visualizations'):
                 attackers = [p for p in occupants if p >= 20]
                 
                 # 根据规则确定颜色和文本
-                if attackers and vehicles:
+                if attackers and vehicles or len(vehicles) > 1:
                     # 碰撞: 红色
                     slot_states[slot_id][0] = 'red'
                 elif attackers and not vehicles:
@@ -73,8 +73,8 @@ def visualize_slot_usage(json_file_path, output_dir='slot_visualizations'):
         ax.set_ylim(0, 1)
         ax.set_xticks(np.arange(0, num_slots, 5))
         ax.set_yticks([])
-        ax.set_xlabel('时隙 (Slot ID)')
-        ax.set_title(f'时间步 {step_index}: 资源时隙占用情况')
+        ax.set_xlabel('Slot ID')
+        ax.set_title(f'step {step_index}: resource slot usage')
         
         # 创建图例
         legend_elements = [
@@ -94,5 +94,5 @@ def visualize_slot_usage(json_file_path, output_dir='slot_visualizations'):
 # --- 主程序入口 ---
 if __name__ == '__main__':
     # 将这里的JSON文件名替换为您自己的文件名
-    json_file = '/home/xhl/mywork/harl/examples/results/v2v/my_v2v_env/happo/newTest/newTestWithEval/TEST2RLATTACKER/seed-00042-2025-10-07-13-39-33/infos/slot_usage_details/eval_episode_1_at_2025-10-07_16-40-47.json'
+    json_file = '/home/xhl/mywork/harl/examples/results/v2v/my_v2v_env/happo/newTest/newTestWithEval/newTest/TESTWITH_INITIAL/TEST20RLVechile_with_1_pretrained_attacker_use_pretrained_vehicle/seed-00042-2025-10-16-16-13-08/infos/slot_usage_details/eval_episode_1_at_2025-10-17_08-07-40.json'
     visualize_slot_usage(json_file)
