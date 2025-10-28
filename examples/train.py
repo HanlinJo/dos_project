@@ -2,7 +2,7 @@
 import argparse
 import json
 from harl.utils.configs_tools import get_defaults_yaml_args, update_args
-
+import multiprocessing 
 
 def main():
     """Main function."""
@@ -25,6 +25,7 @@ def main():
             "matd3",
             "mappo",
             "ea_happo",
+            "happo_adversarial",
         ],
         help="Algorithm name. Choose from: happo, hatrpo, haa2c, haddpg, hatd3, hasac, had3qn, maddpg, matd3, mappo.",
     )
@@ -94,4 +95,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method('spawn', force=True) 
     main()

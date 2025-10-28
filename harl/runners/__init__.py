@@ -3,6 +3,7 @@ from harl.runners.on_policy_ha_runner import OnPolicyHARunner
 from harl.runners.on_policy_ma_runner import OnPolicyMARunner
 from harl.runners.off_policy_ha_runner import OffPolicyHARunner
 from harl.runners.off_policy_ma_runner import OffPolicyMARunner
+from harl.runners.on_policy_ha_runner_adversarial import OnPolicyHARunnerAdversarial 
 
 RUNNER_REGISTRY = {
     "happo": OnPolicyHARunner,
@@ -16,5 +17,7 @@ RUNNER_REGISTRY = {
     "matd3": OffPolicyMARunner,
     "mappo": OnPolicyMARunner,
     "ea_happo": OnPolicyHARunner,
+    "happo_adversarial": OnPolicyHARunnerAdversarial,  # <--- 添加这一行来注册您的新算法
+    
 
 }
